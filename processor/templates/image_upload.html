@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Smart Image Processor</title>
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #f0f2f5;
+            --surface: #ffffff;
+            --surface2: #f5f6f8;
+            --border: rgba(0,0,0,0.08);
+            --accent: #2563eb;
+            --accent2: #0ea5e9;
+            --text: #1a1a2e;
+            --muted: #8a8fa8;
+            --danger: #ef4444;
+        }
+
+        body {
+            font-family: 'DM Mono', monospace;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* ── NOISE OVERLAY ── */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 1000;
+            opacity: 0.4;
+        }
+
+        /* ── GLOW ORBS ── */
+        .orb {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(120px);
+            pointer-events: none;
+            z-index: 0;
+        }
+        .orb-1 {
+            width: 500px; height: 500px;
+            background: rgba(37,99,235,0.08);
+            top: -150px; right: -100px;
+            animation: drift 12s ease-in-out infinite alternate;
+        }
+        .orb-2 {
+            width: 400px; height: 400px;
+            background: rgba(14,165,233,0.07);
+            bottom: -100px; left: -80px;
+            animation: drift 16s ease-in-out infinite alternate-reverse;
+        }
+        @keyframes drift {
+            from { transform: translate(0, 0); }
+            to   { transform: translate(40px, 30px); }
+        }
+
+        /* ── LAYOUT ── */
+        .wrapper {
+            position: relative;
+            z-index: 1;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 60px 32px 100px;
+        }
+
+        /* ── HEADER ── */
+        header {
+            margin-bottom: 56px;
+            animation: fadeUp 0.6s ease both;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 10px;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--accent);
+            background: rgba(37,99,235,0.08);
+            border: 1px solid rgba(37,99,235,0.2);
+            border-radius: 100px;
+            padding: 4px 12px;
+            margin-bottom: 18px;
+        }
+        .badge::before {
+            content: '';
+            width: 6px; height: 6px;
+            background: var(--accent);
+            border-radius: 50%;
+            animation: blink 2s step-end infinite;
+        }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+        h1 {
+            font-family: 'Syne', sans-serif;
+            font-size: clamp(32px, 6vw, 56px);
+            font-weight: 800;
+            line-height: 1.05;
+            letter-spacing: -0.02em;
+        }
+        h1 em {
+            font-style: normal;
+            color: var(--accent);
+        }
+        .subtitle {
+            margin-top: 12px;
+            font-size: 13px;
+            color: var(--muted);
+            letter-spacing: 0.03em;
+        }
+
+        /* ── FORM CARD ── */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 36px;
+            margin-bottom: 24px;
+            animation: fadeUp 0.6s ease both;
+            box-shadow: 0 2px 16px rgba(0,0,0,0.06);
+        }
+        .card:nth-child(2) { animation-delay: 0.1s; }
+        .card:nth-child(3) { animation-delay: 0.2s; }
+
+        .card-label {
+            font-family: 'Syne', sans-serif;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .card-label::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+
+        /* ── FIELD ── */
+        .field { margin-bottom: 20px; }
+        .field:last-child { margin-bottom: 0; }
+
+        label {
+            display: block;
+            font-size: 11px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin-bottom: 8px;
+        }
+
+        /* ── FILE INPUT ── */
+        .file-drop {
+            position: relative;
+            border: 1.5px dashed var(--border);
+            border-radius: 10px;
+            padding: 28px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+        }
+        .file-drop:hover {
+            border-color: rgba(37,99,235,0.4);
+            background: rgba(37,99,235,0.03);
+        }
+        .file-drop input[type="file"] {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            cursor: pointer;
+            width: 100%;
+            height: 100%;
+        }
+        .file-drop-icon {
+            font-size: 28px;
+            margin-bottom: 8px;
+            opacity: 0.5;
+        }
+        .file-drop-text {
+            font-size: 12px;
+            color: var(--muted);
+        }
+        .file-drop-text strong {
+            color: var(--accent);
+            font-weight: 500;
+        }
+        .file-name {
+            margin-top: 6px;
+            font-size: 11px;
+            color: var(--accent2);
+            min-height: 16px;
+        }
+
+        /* ── TEXT INPUT ── */
+        input[type="text"] {
+            width: 100%;
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 11px 14px;
+            color: var(--text);
+            font-family: 'DM Mono', monospace;
+            font-size: 13px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus {
+            border-color: rgba(37,99,235,0.4);
+            box-shadow: 0 0 0 3px rgba(37,99,235,0.08);
+        }
+        input[type="text"]::placeholder { color: var(--muted); }
+
+        /* ── COLOR PICKER ── */
+        .color-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .color-swatch-wrap {
+            position: relative;
+            width: 42px; height: 42px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+        .color-swatch-wrap input[type="color"] {
+            position: absolute;
+            inset: -4px;
+            width: calc(100% + 8px);
+            height: calc(100% + 8px);
+            border: none;
+            cursor: pointer;
+            opacity: 0;
+        }
+        .color-preview {
+            width: 100%; height: 100%;
+            border-radius: 8px;
+            background: #000000;
+        }
+        .color-hex {
+            font-size: 13px;
+            color: var(--text);
+        }
+
+        /* ── GRID ── */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } }
+
+        /* ── SUBMIT BUTTON ── */
+        .btn-submit {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            width: 100%;
+            padding: 16px;
+            background: var(--accent);
+            color: #0a0a0f;
+            font-family: 'Syne', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.2s, filter 0.2s;
+            margin-top: 28px;
+        }
+        .btn-submit:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(200,255,0,0.25);
+            filter: brightness(1.08);
+        }
+        .btn-submit:active { transform: translateY(0); }
+        .btn-submit svg { flex-shrink: 0; }
+
+        /* ── LOADER ── */
+        #loader {
+            display: none;
+            align-items: center;
+            gap: 14px;
+            background: rgba(200,255,0,0.06);
+            border: 1px solid rgba(200,255,0,0.15);
+            border-radius: 10px;
+            padding: 16px 20px;
+            font-size: 13px;
+            color: var(--accent);
+            margin-top: 16px;
+            animation: fadeUp 0.3s ease both;
+        }
+        .spinner {
+            width: 18px; height: 18px;
+            border: 2px solid rgba(200,255,0,0.2);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            flex-shrink: 0;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ── SECTION HEADINGS ── */
+        .section-heading {
+            font-family: 'Syne', sans-serif;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin: 48px 0 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            animation: fadeUp 0.5s ease both;
+        }
+        .section-heading::before, .section-heading::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+
+        /* ── PREVIEW GRID ── */
+        .preview-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+            gap: 12px;
+        }
+        .preview-item {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
+            animation: popIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .preview-item:hover {
+            transform: translateY(-4px) scale(1.02);
+            box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+        }
+        .preview-item img {
+            width: 100%;
+            aspect-ratio: 1;
+            object-fit: cover;
+            display: block;
+        }
+        .preview-item-label {
+            font-size: 9px;
+            letter-spacing: 0.06em;
+            color: var(--muted);
+            padding: 6px 8px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* ── EMPTY STATE ── */
+        .empty-state {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 48px 20px;
+            color: var(--muted);
+            font-size: 12px;
+            border: 1.5px dashed var(--border);
+            border-radius: 12px;
+        }
+        .empty-state-icon { font-size: 32px; margin-bottom: 10px; opacity: 0.3; }
+
+        /* ── ANIMATIONS ── */
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(16px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes popIn {
+            from { opacity: 0; transform: scale(0.85); }
+            to   { opacity: 1; transform: scale(1); }
+        }
+
+        /* ── HR ── */
+        hr { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+
+<div class="wrapper">
+
+    <!-- HEADER -->
+    <header>
+        <div class="badge">v2.0 · AI Powered</div>
+        <h1>Smart <em>Image</em><br>Processor</h1>
+        <p class="subtitle">// upload · match · export · automate</p>
+    </header>
+
+    <form id="uploadForm">
+        {% csrf_token %}
+
+        <!-- UPLOADS CARD -->
+        <div class="card">
+            <div class="card-label">01 — Inputs</div>
+
+            <div class="field">
+                <label>Excel File</label>
+                <div class="file-drop" id="excelDrop">
+                    <input type="file" name="excel_file" id="excelInput" required accept=".xlsx,.xls,.csv">
+                    <div class="file-drop-icon">📊</div>
+                    <div class="file-drop-text">Drop file or <strong>click to browse</strong></div>
+                    <div class="file-name" id="excelName">No file selected</div>
+                </div>
+            </div>
+
+            <div class="field">
+                <label>Images</label>
+                <div class="file-drop" id="imageDrop">
+                    <input 
+                        type="file" 
+                        id="imageInput" 
+                        name="images" 
+                        multiple 
+                        webkitdirectory 
+                        directory accept="image/*">
+                    <div class="file-drop-icon">🖼</div>
+                    <div class="file-drop-text">Drop images or <strong>click to browse</strong></div>
+                    <div class="file-name" id="imageName">No files selected</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- PATHS + COLOR CARD -->
+        <div class="card">
+            <div class="card-label">02 — Configuration</div>
+
+            <div class="grid-2">
+                <div class="field">
+                    <label>Itemwise Folder Path</label>
+                    <input type="text" name="itemwise_folder" placeholder="media/Itemwise">
+                </div>
+                <div class="field">
+                    <label>StyleBio Folder Path</label>
+                    <input type="text" name="stylebio_folder" placeholder="media/StyleBio">
+                </div>
+            </div>
+
+            <div class="field" style="margin-top:4px">
+                <label>Background Color</label>
+                <div class="color-row">
+                    <div class="color-swatch-wrap">
+                        <div class="color-preview" id="colorPreview"></div>
+                        <input type="color" id="bgColor" name="bg_color">
+                    </div>
+                    <span class="color-hex" id="colorHex">#000000</span>
+                </div>
+            </div>
+        </div>
+
+        <button type="submit" class="btn-submit">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                <path d="M5 12h14M12 5l7 7-7 7"/>
+            </svg>
+            Process Images
+        </button>
+    </form>
+
+    <div id="loader">
+        <div class="spinner"></div>
+        Processing images — please wait…
+    </div>
+
+    <!-- ORIGINAL PREVIEW -->
+    <div class="section-heading">Original Preview</div>
+    <div class="preview-grid" id="originalPreview">
+        <div class="empty-state">
+            <div class="empty-state-icon">📂</div>
+            Upload images to see a preview here
+        </div>
+    </div>
+
+    <!-- PROCESSED PREVIEW -->
+    <div class="section-heading" style="animation-delay:0.1s">Processed Preview</div>
+    <div class="preview-grid" id="processedPreview">
+        <div class="empty-state">
+            <div class="empty-state-icon">⚙️</div>
+            Processed results will appear here
+        </div>
+    </div>
+
+</div>
+
+<script>
+// ── CSRF ──
+function getCSRFToken() {
+    const el = document.querySelector('[name=csrfmiddlewaretoken]');
+    return el ? el.value : '';
+}
+
+// ── FILE NAME DISPLAY ──
+document.getElementById("excelInput").addEventListener("change", function () {
+    const name = this.files[0] ? this.files[0].name : "No file selected";
+    document.getElementById("excelName").textContent = name;
+});
+
+document.getElementById("imageInput").addEventListener("change", function () {
+    const count = this.files.length;
+    document.getElementById("imageName").textContent =
+        count === 0 ? "No files selected" : `${count} file${count > 1 ? 's' : ''} selected`;
+
+    const container = document.getElementById("originalPreview");
+    container.innerHTML = "";
+
+    Array.from(this.files).forEach((file, i) => {
+        const item = document.createElement("div");
+        item.className = "preview-item";
+        item.style.animationDelay = `${i * 0.05}s`;
+
+        const img = document.createElement("img");
+        img.src = URL.createObjectURL(file);
+        img.alt = file.name;
+
+        const lbl = document.createElement("div");
+        lbl.className = "preview-item-label";
+        lbl.textContent = file.name;
+
+        item.appendChild(img);
+        item.appendChild(lbl);
+        container.appendChild(item);
+    });
+});
+
+// ── COLOR PICKER ──
+const bgColor = document.getElementById("bgColor");
+const colorPreview = document.getElementById("colorPreview");
+const colorHex = document.getElementById("colorHex");
+
+bgColor.addEventListener("input", function () {
+    const color = this.value;
+    colorPreview.style.background = color;
+    colorHex.textContent = color.toUpperCase();
+    document.querySelectorAll("#processedPreview img").forEach(img => {
+        img.style.backgroundColor = color;
+    });
+});
+// Init preview color
+colorPreview.style.background = bgColor.value;
+
+// ── FORM SUBMIT ──
+document.getElementById("uploadForm").addEventListener("submit", async function (e) {
+    e.preventDefault();
+
+    const formData = new FormData(this);
+    const loader = document.getElementById("loader");
+    loader.style.display = "flex";
+
+    try {
+        const response = await fetch("/process-images/", {
+            method: "POST",
+            body: formData,
+            headers: { "X-CSRFToken": getCSRFToken() }
+        });
+
+        const data = await response.json();
+        loader.style.display = "none";
+
+        const container = document.getElementById("processedPreview");
+        container.innerHTML = "";
+
+        if (!data.data) {
+            container.innerHTML = `<div class="empty-state" style="color:var(--danger)">
+                <div class="empty-state-icon">⚠️</div>
+                ${data.error || "Something went wrong"}
+            </div>`;
+            return;
+        }
+
+        data.data.forEach((item, i) => {
+            if (item.status === "success") {
+                const wrap = document.createElement("div");
+                wrap.className = "preview-item";
+                wrap.style.animationDelay = `${i * 0.05}s`;
+
+                const img = document.createElement("img");
+                img.src = "data:image/png;base64," + item.preview;
+                img.title = `Category: ${item.category}\nStyle: ${item.style}`;
+                img.style.backgroundColor = bgColor.value;
+
+                const lbl = document.createElement("div");
+                lbl.className = "preview-item-label";
+                lbl.textContent = item.category || item.style || "Processed";
+
+                wrap.appendChild(img);
+                wrap.appendChild(lbl);
+                container.appendChild(wrap);
+            }
+        });
+
+        if (container.children.length === 0) {
+            container.innerHTML = `<div class="empty-state">
+                <div class="empty-state-icon">🔍</div>
+                No successful results found
+            </div>`;
+        }
+
+    } catch (err) {
+        loader.style.display = "none";
+        alert("Request failed: " + err);
+    }
+});
+</script>
+
+</body>
+</html>
