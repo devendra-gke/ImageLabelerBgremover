@@ -1,180 +1,273 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>Smart Image Processor</title>
-    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+    <title>Gurukrupa Exports — Image Processor</title>
+    <link href="https://fonts.googleapis.com/css2?family=Clash+Display:wght@400;500;600;700&family=Cabinet+Grotesk:wght@300;400;500;700&family=Instrument+Mono&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
         :root {
-            --bg: #f0f2f5;
-            --surface: #ffffff;
-            --surface2: #f5f6f8;
-            --border: rgba(0,0,0,0.08);
-            --accent: #2563eb;
-            --accent2: #0ea5e9;
-            --text: #1a1a2e;
-            --muted: #8a8fa8;
-            --danger: #ef4444;
+            --ink:     #0d0d0d;
+            --paper:   #f7f4ef;
+            --cream:   #ede9e1;
+            --rust:    #c94a2b;
+            --gold:    #d4a843;
+            --sage:    #5a7a5e;
+            --muted:   #9a948a;
+            --border:  #ddd8ce;
+            --card:    #ffffff;
         }
 
+        html { scroll-behavior: smooth; }
+
         body {
-            font-family: 'DM Mono', monospace;
-            background: var(--bg);
-            color: var(--text);
+            font-family: 'Space Grotesk', sans-serif;
+            background: var(--paper);
+            color: var(--ink);
             min-height: 100vh;
             overflow-x: hidden;
         }
 
-        /* ── NOISE OVERLAY ── */
-        body::before {
+        /* ── GRAIN ── */
+        body::after {
             content: '';
             position: fixed;
             inset: 0;
-            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)' opacity='0.035'/%3E%3C/svg%3E");
             pointer-events: none;
-            z-index: 1000;
-            opacity: 0.4;
+            z-index: 999;
         }
 
-        /* ── GLOW ORBS ── */
-        .orb {
+        /* ── STRIPE ACCENT ── */
+        .stripe {
             position: fixed;
-            border-radius: 50%;
-            filter: blur(120px);
-            pointer-events: none;
-            z-index: 0;
-        }
-        .orb-1 {
-            width: 500px; height: 500px;
-            background: rgba(37,99,235,0.08);
-            top: -150px; right: -100px;
-            animation: drift 12s ease-in-out infinite alternate;
-        }
-        .orb-2 {
-            width: 400px; height: 400px;
-            background: rgba(14,165,233,0.07);
-            bottom: -100px; left: -80px;
-            animation: drift 16s ease-in-out infinite alternate-reverse;
-        }
-        @keyframes drift {
-            from { transform: translate(0, 0); }
-            to   { transform: translate(40px, 30px); }
+            top: 0; left: 0;
+            width: 4px;
+            height: 100vh;
+            background: repeating-linear-gradient(
+                180deg,
+                /* var(--rust) 0px, */
+                var(--rust) 32px,
+                transparent 32px,
+                transparent 48px
+            );
+            z-index: 100;
         }
 
-        /* ── LAYOUT ── */
+        /* ── TOP BAR ── */
+        .topbar {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            height: 52px;
+            background-color: #9d8658;
+            display: flex;
+            align-items: center;
+            padding: 0 32px 0 24px;
+            z-index: 50;
+            gap: 0;
+        }
+        .topbar-left {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 16px;
+            flex: 1;
+        }
+        .topbar-logo {
+            font-family: 'Bebas Neue', cursive;
+            font-size: 17px;
+            letter-spacing: 0.15em;
+            color: #ffffff;
+        }
+        .topbar-div {
+            width: 1px;
+            height: 20px;
+            background: rgba(255,255,255,0.12);
+        }
+        .topbar-sub {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: #ffffff;
+        }
+        .topbar-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: white;
+        }
+        .topbar-dot {
+            width: 6px; height: 6px;
+            background: teal;
+            border-radius: 50%;
+            animation: pulse-dot 2.5s ease-in-out infinite;
+        }
+        @keyframes pulse-dot {
+            0%,100% { opacity: 1; transform: scale(1); }
+            50%      { opacity: 0.4; transform: scale(0.7); }
+        }
+
+        /* ── WRAPPER ── */
         .wrapper {
+            max-width: 1080px;
+            margin: 0 auto;
+            padding:70px 40px 120px 2px;
             position: relative;
             z-index: 1;
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 60px 32px 100px;
         }
 
         /* ── HEADER ── */
-        header {
-            margin-bottom: 56px;
-            animation: fadeUp 0.6s ease both;
+        .hero {
+            margin-bottom: 72px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+            display: grid;
+            grid-template-columns: 1fr auto;
+            align-items: end;
+            gap: 32px;
         }
-        .badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
+        .hero-eyebrow {
+            font-family: 'JetBrains Mono', monospace;
             font-size: 10px;
-            letter-spacing: 0.15em;
+            letter-spacing: 0.2em;
             text-transform: uppercase;
-            color: var(--accent);
-            background: rgba(37,99,235,0.08);
-            border: 1px solid rgba(37,99,235,0.2);
-            border-radius: 100px;
-            padding: 4px 12px;
-            margin-bottom: 18px;
-        }
-        .badge::before {
-            content: '';
-            width: 6px; height: 6px;
-            background: var(--accent);
-            border-radius: 50%;
-            animation: blink 2s step-end infinite;
-        }
-        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
-
-        h1 {
-            font-family: 'Syne', sans-serif;
-            font-size: clamp(32px, 6vw, 56px);
-            font-weight: 800;
-            line-height: 1.05;
-            letter-spacing: -0.02em;
-        }
-        h1 em {
-            font-style: normal;
-            color: var(--accent);
-        }
-        .subtitle {
-            margin-top: 12px;
-            font-size: 13px;
-            color: var(--muted);
-            letter-spacing: 0.03em;
-        }
-
-        /* ── FORM CARD ── */
-        .card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-            padding: 36px;
-            margin-bottom: 24px;
-            animation: fadeUp 0.6s ease both;
-            box-shadow: 0 2px 16px rgba(0,0,0,0.06);
-        }
-        .card:nth-child(2) { animation-delay: 0.1s; }
-        .card:nth-child(3) { animation-delay: 0.2s; }
-
-        .card-label {
-            font-family: 'Syne', sans-serif;
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 0.15em;
-            text-transform: uppercase;
-            color: var(--muted);
-            margin-bottom: 24px;
+            color: var(--rust);
+            margin-bottom: 16px;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
         }
-        .card-label::after {
+        .hero-eyebrow::before {
             content: '';
+            width: 24px; height: 1px;
+            background: var(--rust);
+        }
+        .hero h1 {
+            font-family: 'Bebas Neue', cursive;
+            font-size: clamp(42px, 7vw, 76px);
+            line-height: 0.95;
+            letter-spacing: 0.04em;
+            color: var(--ink);
+        }
+        .hero h1 span {
+            color: var(--rust);
+        }
+        .hero-meta {
+            text-align: right;
+        }
+        .hero-version {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            color: var(--muted);
+            letter-spacing: 0.12em;
+            margin-bottom: 4px;
+        }
+        .hero-tagline {
+            font-size: 11px;
+            color: var(--muted);
+            letter-spacing: 0.05em;
+        }
+
+        /* ── STEP LABELS ── */
+        .step-header {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-bottom: 28px;
+        }
+        .step-num {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            font-weight: 500;
+            letter-spacing: 0.15em;
+            color: var(--card);
+            background: var(--ink);
+            width: 28px; height: 28px;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0;
+        }
+        .step-title {
+            font-family: 'Bebas Neue', cursive;
+            font-size: 20px;
+            letter-spacing: 0.12em;
+            color: var(--ink);
+        }
+        .step-line {
             flex: 1;
             height: 1px;
             background: var(--border);
         }
 
-        /* ── FIELD ── */
-        .field { margin-bottom: 20px; }
-        .field:last-child { margin-bottom: 0; }
+        /* ── CARDS ── */
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 36px;
+            margin-bottom: 20px;
+            position: relative;
+            overflow: hidden;
+            animation: riseIn 0.5s ease both;
+        }
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0;
+            width: 3px; height: 100%;
+            background: var(--rust);
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .card:focus-within::before { opacity: 1; }
 
-        label {
-            display: block;
-            font-size: 11px;
-            letter-spacing: 0.08em;
+        @keyframes riseIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .card:nth-child(2) { animation-delay: 0.08s; }
+        .card:nth-child(3) { animation-delay: 0.16s; }
+
+        /* ── FIELD ── */
+        .field { margin-bottom: 24px; }
+        .field:last-child { margin-bottom: 0; }
+        .field-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 0.18em;
             text-transform: uppercase;
             color: var(--muted);
-            margin-bottom: 8px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .field-label span {
+            color: var(--rust);
+            font-size: 14px;
+            line-height: 1;
         }
 
-        /* ── FILE INPUT ── */
+        /* ── FILE DROP ── */
         .file-drop {
             position: relative;
             border: 1.5px dashed var(--border);
-            border-radius: 10px;
-            padding: 28px 20px;
+            border-radius: 2px;
+            padding: 32px 24px;
             text-align: center;
             cursor: pointer;
-            transition: border-color 0.2s, background 0.2s;
+            transition: border-color 0.25s, background 0.25s;
+            background: var(--paper);
         }
         .file-drop:hover {
-            border-color: rgba(37,99,235,0.4);
-            background: rgba(37,99,235,0.03);
+            border-color: var(--rust);
+            background: rgba(201,74,43,0.03);
         }
         .file-drop input[type="file"] {
             position: absolute;
@@ -185,58 +278,82 @@
             height: 100%;
         }
         .file-drop-icon {
-            font-size: 28px;
-            margin-bottom: 8px;
-            opacity: 0.5;
+            font-size: 26px;
+            margin-bottom: 10px;
+            display: block;
         }
-        .file-drop-text {
-            font-size: 12px;
+        .file-drop-title {
+            font-family: 'Bebas Neue', cursive;
+            font-size: 15px;
+            letter-spacing: 0.1em;
+            color: var(--ink);
+            margin-bottom: 4px;
+        }
+        .file-drop-hint {
+            font-size: 11px;
             color: var(--muted);
+            font-family: 'JetBrains Mono', monospace;
         }
-        .file-drop-text strong {
-            color: var(--accent);
+        .file-drop-hint strong {
+            color: var(--rust);
             font-weight: 500;
         }
         .file-name {
-            margin-top: 6px;
-            font-size: 11px;
-            color: var(--accent2);
-            min-height: 16px;
+            margin-top: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            color: var(--sage);
+            letter-spacing: 0.06em;
+            min-height: 14px;
         }
+
+        /* ── GRID ── */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 580px) { .grid-2 { grid-template-columns: 1fr; } }
 
         /* ── TEXT INPUT ── */
         input[type="text"] {
             width: 100%;
-            background: var(--surface2);
+            background: var(--paper);
             border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 11px 14px;
-            color: var(--text);
-            font-family: 'DM Mono', monospace;
-            font-size: 13px;
+            border-radius: 2px;
+            padding: 12px 14px;
+            color: var(--ink);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            letter-spacing: 0.04em;
             outline: none;
-            transition: border-color 0.2s;
+            transition: border-color 0.2s, box-shadow 0.2s;
         }
         input[type="text"]:focus {
-            border-color: rgba(37,99,235,0.4);
-            box-shadow: 0 0 0 3px rgba(37,99,235,0.08);
+            border-color: var(--rust);
+            box-shadow: 0 0 0 3px rgba(201,74,43,0.08);
         }
-        input[type="text"]::placeholder { color: var(--muted); }
+        input[type="text"]::placeholder {
+            color: var(--muted);
+            opacity: 0.6;
+        }
 
         /* ── COLOR PICKER ── */
         .color-row {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 14px;
         }
         .color-swatch-wrap {
             position: relative;
-            width: 42px; height: 42px;
-            border-radius: 8px;
+            width: 44px; height: 44px;
+            border-radius: 2px;
             border: 1px solid var(--border);
             overflow: hidden;
             flex-shrink: 0;
+            cursor: pointer;
         }
+        .color-swatch-wrap:hover { border-color: var(--rust); }
         .color-swatch-wrap input[type="color"] {
             position: absolute;
             inset: -4px;
@@ -248,113 +365,150 @@
         }
         .color-preview {
             width: 100%; height: 100%;
-            border-radius: 8px;
             background: #000000;
         }
+        .color-info {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
         .color-hex {
-            font-size: 13px;
-            color: var(--text);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--ink);
+            letter-spacing: 0.08em;
         }
-
-        /* ── GRID ── */
-        .grid-2 {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 16px;
+        .color-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--muted);
         }
-        @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } }
 
         /* ── SUBMIT BUTTON ── */
         .btn-submit {
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 10px;
+            gap: 12px;
             width: 100%;
-            padding: 16px;
-            background: var(--accent);
-            color: #0a0a0f;
-            font-family: 'Syne', sans-serif;
-            font-size: 14px;
-            font-weight: 700;
-            letter-spacing: 0.08em;
+            padding: 18px 32px;
+            background: var(--ink);
+            color: var(--paper);
+            font-family: 'Bebas Neue', cursive;
+            font-size: 17px;
+            font-weight: 400;
+            letter-spacing: 0.2em;
             text-transform: uppercase;
             border: none;
-            border-radius: 10px;
+            border-radius: 2px;
             cursor: pointer;
-            transition: transform 0.15s, box-shadow 0.2s, filter 0.2s;
-            margin-top: 28px;
+            transition: background 0.2s, transform 0.15s, box-shadow 0.2s;
+            margin-top: 32px;
+            position: relative;
+            overflow: hidden;
+            border-radius: 10px;
         }
-        .btn-submit:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 32px rgba(200,255,0,0.25);
-            filter: brightness(1.08);
+        .btn-submit::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: var(--rust);
+            transform: translateX(-101%);
+            transition: transform 0.3s cubic-bezier(0.4,0,0.2,1);
+            z-index: 0;
+            color: white;
         }
+        .btn-submit:hover::after { transform: translateX(0);color: white; }
+        .btn-submit:hover { transform: translateY(-2px); box-shadow: 0 10px 40px rgba(0,0,0,0.18); }
         .btn-submit:active { transform: translateY(0); }
-        .btn-submit svg { flex-shrink: 0; }
+        .btn-submit > * { position: relative; z-index: 1; }
 
         /* ── LOADER ── */
         #loader {
             display: none;
             align-items: center;
-            gap: 14px;
-            background: rgba(200,255,0,0.06);
-            border: 1px solid rgba(200,255,0,0.15);
-            border-radius: 10px;
-            padding: 16px 20px;
-            font-size: 13px;
-            color: var(--accent);
+            gap: 16px;
+            background: var(--ink);
+            color: var(--paper);
+            border-radius: 2px;
+            padding: 18px 24px;
+            font-size: 12px;
+            letter-spacing: 0.08em;
             margin-top: 16px;
-            animation: fadeUp 0.3s ease both;
+            font-family: 'JetBrains Mono', monospace;
+            animation: riseIn 0.3s ease both;
         }
         .spinner {
-            width: 18px; height: 18px;
-            border: 2px solid rgba(200,255,0,0.2);
-            border-top-color: var(--accent);
+            width: 20px; height: 20px;
+            border: 2px solid rgba(247,244,239,0.2);
+            border-top-color: var(--rust);
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
             flex-shrink: 0;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+        .loader-text { color: rgba(247,244,239,0.7); }
+        .loader-text strong { color: var(--paper); }
 
-        /* ── SECTION HEADINGS ── */
-        .section-heading {
-            font-family: 'Syne', sans-serif;
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 0.15em;
-            text-transform: uppercase;
-            color: var(--muted);
-            margin: 48px 0 20px;
+        /* ── SECTION DIVIDER ── */
+        .section-divider {
             display: flex;
             align-items: center;
-            gap: 10px;
-            animation: fadeUp 0.5s ease both;
+            gap: 16px;
+            margin: 56px 0 28px;
+            animation: riseIn 0.5s ease both;
         }
-        .section-heading::before, .section-heading::after {
-            content: '';
+        .section-divider-num {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--muted);
+            white-space: nowrap;
+        }
+        .section-divider-title {
+            font-family: 'Bebas Neue', cursive;
+            font-size: 22px;
+            letter-spacing: 0.12em;
+            color: var(--ink);
+            white-space: nowrap;
+        }
+        .section-divider-line {
             flex: 1;
             height: 1px;
             background: var(--border);
+        }
+        .section-divider-count {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 0.1em;
+            color: var(--muted);
+            white-space: nowrap;
         }
 
         /* ── PREVIEW GRID ── */
         .preview-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
             gap: 12px;
         }
         .preview-item {
-            background: var(--surface);
+            background: var(--card);
             border: 1px solid var(--border);
-            border-radius: 10px;
+            border-radius: 2px;
             overflow: hidden;
-            animation: popIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) both;
-            transition: transform 0.2s, box-shadow 0.2s;
+            animation: popIn 0.4s cubic-bezier(0.34,1.56,0.64,1) both;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
+            position: relative;
         }
         .preview-item:hover {
-            transform: translateY(-4px) scale(1.02);
-            box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+            transform: translateY(-4px);
+            box-shadow: 0 16px 40px rgba(0,0,0,0.12);
+            border-color: var(--rust);
         }
         .preview-item img {
             width: 100%;
@@ -363,116 +517,195 @@
             display: block;
         }
         .preview-item-label {
+            padding: 7px 10px;
+            font-family: 'JetBrains Mono', monospace;
             font-size: 9px;
             letter-spacing: 0.06em;
             color: var(--muted);
-            padding: 6px 8px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
+            border-top: 1px solid var(--border);
+        }
+        .preview-item-tag {
+            position: absolute;
+            top: 6px; right: 6px;
+            background: var(--sage);
+            color: white;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 8px;
+            letter-spacing: 0.08em;
+            padding: 2px 6px;
+            border-radius: 1px;
+            text-transform: uppercase;
         }
 
         /* ── EMPTY STATE ── */
         .empty-state {
             grid-column: 1 / -1;
             text-align: center;
-            padding: 48px 20px;
+            padding: 56px 24px;
             color: var(--muted);
-            font-size: 12px;
             border: 1.5px dashed var(--border);
-            border-radius: 12px;
+            border-radius: 2px;
+            background: rgba(247,244,239,0.5);
         }
-        .empty-state-icon { font-size: 32px; margin-bottom: 10px; opacity: 0.3; }
+        .empty-state-icon {
+            font-size: 28px;
+            margin-bottom: 12px;
+            opacity: 0.4;
+            display: block;
+        }
+        .empty-state-text {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
 
-        /* ── ANIMATIONS ── */
-        @keyframes fadeUp {
-            from { opacity: 0; transform: translateY(16px); }
-            to   { opacity: 1; transform: translateY(0); }
-        }
+        /* ── ANIM ── */
         @keyframes popIn {
-            from { opacity: 0; transform: scale(0.85); }
+            from { opacity: 0; transform: scale(0.88); }
             to   { opacity: 1; transform: scale(1); }
         }
 
-        /* ── HR ── */
+        /* ── FOOTER ── */
+        .footer {
+            margin-top: 80px;
+            padding-top: 24px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+        .footer-brand {
+            font-family: 'Bebas Neue', cursive;
+            font-size: 13px;
+            letter-spacing: 0.15em;
+            color: var(--muted);
+        }
+        .footer-note {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 0.1em;
+            color: var(--muted);
+            opacity: 0.6;
+            text-transform: uppercase;
+        }
+
         hr { display: none; }
     </style>
 </head>
 <body>
 
-<div class="orb orb-1"></div>
-<div class="orb orb-2"></div>
+<div class="stripe"></div>
+
+<!-- TOP BAR -->
+<div class="topbar">
+    <div class="topbar-left">
+        <div class="topbar-logo">Gurukrupa Exports</div>
+        <div class="topbar-div"></div>
+        <div class="topbar-sub">Image Processor</div>
+    </div>
+    <div class="topbar-status">
+        <div class="topbar-dot"></div>
+        AI POWERED
+    </div>
+</div>
 
 <div class="wrapper">
 
-    <!-- HEADER -->
-    <header>
-        <div class="badge">v2.0 · AI Powered</div>
-        <h1>Smart <em>Image</em><br>Processor</h1>
-        <p class="subtitle">// upload · match · export · automate</p>
+    <!-- HERO -->
+    <header class="hero">
+        <div>
+            <div class="hero-eyebrow">Automated Image Pipeline</div>
+            <h1>GURUKRUPA EXPORTS <span>PVT LTD</span></h1>
+        </div>
+        <div class="hero-meta">
+            <div class="hero-version">v 1.0.0</div>
+            <div class="hero-tagline">upload · match · export</div>
+        </div>
     </header>
 
     <form id="uploadForm">
         {% csrf_token %}
 
-        <!-- UPLOADS CARD -->
+        <!-- STEP 1 — INPUTS -->
+        <div class="step-header">
+            <div class="step-num">01</div>
+            <div class="step-title">Upload Inputs</div>
+            <div class="step-line"></div>
+        </div>
+
         <div class="card">
-            <div class="card-label">01 — Inputs</div>
-
-            <div class="field">
-                <label>Excel File</label>
-                <div class="file-drop" id="excelDrop">
-                    <input type="file" name="excel_file" id="excelInput" required accept=".xlsx,.xls,.csv">
-                    <div class="file-drop-icon">📊</div>
-                    <div class="file-drop-text">Drop file or <strong>click to browse</strong></div>
-                    <div class="file-name" id="excelName">No file selected</div>
+            <div class="grid-2">
+                <div class="field">
+                    <div class="field-label"><span>◆</span> Excel File</div>
+                    <div class="file-drop" id="excelDrop">
+                        <input type="file" name="excel_file" id="excelInput" required accept=".xlsx,.xls,.csv">
+                        <span class="file-drop-icon">📊</span>
+                        <div class="file-drop-title">Drop Excel File</div>
+                        <div class="file-drop-hint">or <strong>click to browse</strong> — .xlsx .xls .csv</div>
+                        <div class="file-name" id="excelName">No file selected</div>
+                    </div>
                 </div>
-            </div>
 
-            <div class="field">
-                <label>Images</label>
-                <div class="file-drop" id="imageDrop">
-                    <input 
-                        type="file" 
-                        id="imageInput" 
-                        name="images" 
-                        multiple 
-                        webkitdirectory 
-                        directory accept="image/*">
-                    <div class="file-drop-icon">🖼</div>
-                    <div class="file-drop-text">Drop images or <strong>click to browse</strong></div>
-                    <div class="file-name" id="imageName">No files selected</div>
+                <div class="field">
+                    <div class="field-label"><span>◆</span> Product Images</div>
+                    <div class="file-drop" id="imageDrop">
+                        <input
+                            type="file"
+                            id="imageInput"
+                            name="images"
+                            multiple
+                            webkitdirectory
+                            directory
+                            accept="image/*">
+                        <span class="file-drop-icon">🖼</span>
+                        <div class="file-drop-title">Drop Images / Folder</div>
+                        <div class="file-drop-hint">or <strong>click to browse</strong> — all formats</div>
+                        <div class="file-name" id="imageName">No files selected</div>
+                    </div>
                 </div>
             </div>
         </div>
 
-        <!-- PATHS + COLOR CARD -->
-        <div class="card">
-            <div class="card-label">02 — Configuration</div>
+        <!-- STEP 2 — CONFIG -->
+        <div class="step-header" style="margin-top:36px">
+            <div class="step-num">02</div>
+            <div class="step-title">Configuration</div>
+            <div class="step-line"></div>
+        </div>
 
-            <div class="grid-2">
+        <div class="card">
+            <div class="grid-2" style="margin-bottom:24px">
                 <div class="field">
-                    <label>Itemwise Folder Path</label>
+                    <div class="field-label"><span>◆</span> Itemwise Folder Path</div>
                     <input type="text" name="itemwise_folder" placeholder="media/Itemwise">
                 </div>
                 <div class="field">
-                    <label>StyleBio Folder Path</label>
+                    <div class="field-label"><span>◆</span> StyleBio Folder Path</div>
                     <input type="text" name="stylebio_folder" placeholder="media/StyleBio">
                 </div>
             </div>
 
-            <div class="field" style="margin-top:4px">
-                <label>Background Color</label>
+            <div class="field">
+                <div class="field-label"><span>◆</span> Background Color</div>
                 <div class="color-row">
                     <div class="color-swatch-wrap">
                         <div class="color-preview" id="colorPreview"></div>
                         <input type="color" id="bgColor" name="bg_color">
                     </div>
-                    <span class="color-hex" id="colorHex">#000000</span>
+                    <div class="color-info">
+                        <div class="color-hex" id="colorHex">#000000</div>
+                        <div class="color-label">Hex Value</div>
+                    </div>
                 </div>
             </div>
         </div>
 
+        <!-- SUBMIT -->
         <button type="submit" class="btn-submit">
             <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
                 <path d="M5 12h14M12 5l7 7-7 7"/>
@@ -481,28 +714,44 @@
         </button>
     </form>
 
+    <!-- LOADER -->
     <div id="loader">
         <div class="spinner"></div>
-        Processing images — please wait…
+        <div class="loader-text"><strong>Processing images</strong> — please wait, this may take a moment…</div>
     </div>
 
     <!-- ORIGINAL PREVIEW -->
-    <div class="section-heading">Original Preview</div>
+    <div class="section-divider">
+        <div class="section-divider-num">preview /</div>
+        <div class="section-divider-title">Original</div>
+        <div class="section-divider-line"></div>
+        <div class="section-divider-count" id="origCount">0 files</div>
+    </div>
     <div class="preview-grid" id="originalPreview">
         <div class="empty-state">
-            <div class="empty-state-icon">📂</div>
-            Upload images to see a preview here
+            <span class="empty-state-icon">📂</span>
+            <div class="empty-state-text">Upload images to see a preview here</div>
         </div>
     </div>
 
     <!-- PROCESSED PREVIEW -->
-    <div class="section-heading" style="animation-delay:0.1s">Processed Preview</div>
+    <div class="section-divider" style="animation-delay:0.1s">
+        <div class="section-divider-num">output /</div>
+        <div class="section-divider-title">Processed</div>
+        <div class="section-divider-line"></div>
+        <div class="section-divider-count" id="procCount">0 results</div>
+    </div>
     <div class="preview-grid" id="processedPreview">
         <div class="empty-state">
-            <div class="empty-state-icon">⚙️</div>
-            Processed results will appear here
+            <span class="empty-state-icon">⚙️</span>
+            <div class="empty-state-text">Processed results will appear here</div>
         </div>
     </div>
+
+    <footer class="footer">
+        <div class="footer-brand">Gurukrupa Exports Pvt. Ltd.</div>
+        <div class="footer-note">Internal Tool · v1.0 · 2025</div>
+    </footer>
 
 </div>
 
@@ -523,6 +772,7 @@ document.getElementById("imageInput").addEventListener("change", function () {
     const count = this.files.length;
     document.getElementById("imageName").textContent =
         count === 0 ? "No files selected" : `${count} file${count > 1 ? 's' : ''} selected`;
+    document.getElementById("origCount").textContent = `${count} file${count !== 1 ? 's' : ''}`;
 
     const container = document.getElementById("originalPreview");
     container.innerHTML = "";
@@ -530,7 +780,7 @@ document.getElementById("imageInput").addEventListener("change", function () {
     Array.from(this.files).forEach((file, i) => {
         const item = document.createElement("div");
         item.className = "preview-item";
-        item.style.animationDelay = `${i * 0.05}s`;
+        item.style.animationDelay = `${i * 0.04}s`;
 
         const img = document.createElement("img");
         img.src = URL.createObjectURL(file);
@@ -559,7 +809,6 @@ bgColor.addEventListener("input", function () {
         img.style.backgroundColor = color;
     });
 });
-// Init preview color
 colorPreview.style.background = bgColor.value;
 
 // ── FORM SUBMIT ──
@@ -584,18 +833,24 @@ document.getElementById("uploadForm").addEventListener("submit", async function 
         container.innerHTML = "";
 
         if (!data.data) {
-            container.innerHTML = `<div class="empty-state" style="color:var(--danger)">
-                <div class="empty-state-icon">⚠️</div>
-                ${data.error || "Something went wrong"}
+            container.innerHTML = `<div class="empty-state">
+                <span class="empty-state-icon">⚠️</span>
+                <div class="empty-state-text">${data.error || "Something went wrong"}</div>
             </div>`;
             return;
         }
 
+        let count = 0;
         data.data.forEach((item, i) => {
             if (item.status === "success") {
+                count++;
                 const wrap = document.createElement("div");
                 wrap.className = "preview-item";
-                wrap.style.animationDelay = `${i * 0.05}s`;
+                wrap.style.animationDelay = `${i * 0.04}s`;
+
+                const tag = document.createElement("div");
+                tag.className = "preview-item-tag";
+                tag.textContent = "Done";
 
                 const img = document.createElement("img");
                 img.src = "data:image/png;base64," + item.preview;
@@ -606,16 +861,19 @@ document.getElementById("uploadForm").addEventListener("submit", async function 
                 lbl.className = "preview-item-label";
                 lbl.textContent = item.category || item.style || "Processed";
 
+                wrap.appendChild(tag);
                 wrap.appendChild(img);
                 wrap.appendChild(lbl);
                 container.appendChild(wrap);
             }
         });
 
+        document.getElementById("procCount").textContent = `${count} result${count !== 1 ? 's' : ''}`;
+
         if (container.children.length === 0) {
             container.innerHTML = `<div class="empty-state">
-                <div class="empty-state-icon">🔍</div>
-                No successful results found
+                <span class="empty-state-icon">🔍</span>
+                <div class="empty-state-text">No successful results found</div>
             </div>`;
         }
 
@@ -625,6 +883,5 @@ document.getElementById("uploadForm").addEventListener("submit", async function 
     }
 });
 </script>
-
 </body>
 </html>
