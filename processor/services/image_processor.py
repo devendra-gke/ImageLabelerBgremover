@@ -2,46 +2,20 @@ from __future__ import annotations
 
 import os
 import pandas as pd
-import numpy as np
-import torch
-import time
+import base64
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
 
-from torchvision import transforms
-from transformers import AutoModelForImageSegmentation
+from transparent_background import Remover
 
 # ---------------- CONFIG ----------------
 SUPPORTED_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
 WINDOWS_TREBUCHET = r"C:\\Windows\\Fonts\\trebuc.ttf"
 
-MODEL_ID = "ZhengPeng7/BiRefNet"
-MODEL_IMAGE_SIZE = (1024, 1024)
+# Initialize remover ONCE
+remover = Remover(mode='base')  # change to 'accurate' if needed
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-torch.set_float32_matmul_precision("high")
-
-# ---------------- TRANSFORM ----------------
-transform_image = transforms.Compose([
-    transforms.Resize(MODEL_IMAGE_SIZE),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        [0.485, 0.456, 0.406],
-        [0.229, 0.224, 0.225]
-    ),
-])
-
-# ---------------- LOAD MODEL ----------------
-model = AutoModelForImageSegmentation.from_pretrained(
-    MODEL_ID,
-    trust_remote_code=True
-)
-model.to(device)
-model.eval()
 
 # ---------------- HELPERS ----------------
 def base_token(s: str) -> str:
@@ -61,6 +35,19 @@ def get_series(df, col_letter):
 
 def sanitize(name):
     return str(name).replace("/", "_").replace("\\", "_").strip()
+
+
+def image_to_base64(img):
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def hex_to_rgb(hex_color):
+    if not hex_color:
+        return (0, 0, 0)
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 
 # ---------------- EXCEL READER ----------------
@@ -110,34 +97,19 @@ def read_excel_mapping(excel_file):
     return mapping, category_map, style_map
 
 
-# ---------------- BACKGROUND REMOVAL ----------------
-def preprocess_image(image: Image.Image):
-    return transform_image(image).unsqueeze(0)
-
-
-def predict_mask(image: Image.Image):
-    input_tensor = preprocess_image(image).to(device)
-
-    with torch.no_grad():
-        preds = model(input_tensor)[-1].sigmoid().cpu()
-
-    pred = preds[0].squeeze()
-
-    mask = transforms.ToPILImage()(pred)
-    mask = mask.resize(image.size)
-
-    return mask.convert("L")
-
-
 def remove_background(image: Image.Image):
-    image = image.convert("RGB")
+    try:
+        image = image.convert("RGB")
+        output = remover.process(image)
 
-    mask = predict_mask(image)
+        if isinstance(output, Image.Image):
+            return output.convert("RGBA")
 
-    cutout = image.copy()
-    cutout.putalpha(mask)
+        return Image.open(BytesIO(output)).convert("RGBA")
 
-    return cutout
+    except Exception as e:
+        print("Transparent BG error:", e)
+        return image  # fallback
 
 
 # ---------------- DRAW TEXT ----------------
@@ -158,27 +130,13 @@ def draw_text(img, lines):
     return img
 
 
-import base64
-from io import BytesIO
-
-def image_to_base64(img):
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode()
-
-def hex_to_rgb(hex_color):
-    hex_color = hex_color.lstrip('#')
-    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
 # ---------------- MAIN FUNCTION ----------------
 def process_images(request):
     excel_file = request.FILES.get('excel_file')
     images = request.FILES.getlist('images')
 
-    # ✅ FIXED (important)
     itemwise_base = request.POST.get('itemwise_folder')
     style_base = request.POST.get('stylebio_folder')
-
     bg_color_hex = request.POST.get('bg_color')
 
     if not excel_file:
@@ -228,17 +186,17 @@ def process_images(request):
                 })
                 continue
 
-            # ---------------- IMAGE LOAD ----------------
+            # ---------------- LOAD IMAGE ----------------
             im = Image.open(img_file)
             im = ImageOps.exif_transpose(im).convert("RGB")
 
-            # ---------------- BG REMOVE (SAFE) ----------------
+            # ---------------- BG REMOVE ----------------
             try:
                 im = remove_background(im)
             except Exception as e:
                 print("BG removal failed:", e)
 
-            # ---------------- BLACK BG ----------------
+            # ---------------- APPLY BG COLOR ----------------
             if im.mode == "RGBA":
                 bg_color = hex_to_rgb(bg_color_hex)
                 bg = Image.new("RGB", im.size, bg_color)
@@ -248,7 +206,7 @@ def process_images(request):
             # ---------------- PREVIEW ----------------
             preview = image_to_base64(im)
 
-            # ---------------- TEXT ----------------
+            # ---------------- DRAW TEXT ----------------
             im = draw_text(im, lines)
 
             # ---------------- CATEGORY SAVE ----------------
