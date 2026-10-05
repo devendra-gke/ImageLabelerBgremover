@@ -7,6 +7,10 @@ from io import BytesIO
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from transparent_background import Remover
+import ssl
+ 
+ssl._create_default_https_context = ssl._create_unverified_context
+print("ssl done")
 
 # ======================================================
 # CONFIGURATION
@@ -15,12 +19,11 @@ from transparent_background import Remover
 SUPPORTED_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 WINDOWS_TREBUCHET = r"C:\Windows\Fonts\trebuc.ttf"
 
-# Final output size
 TARGET_WIDTH = 1750
 TARGET_HEIGHT = 1160
 
-# Initialize background remover once
-remover = Remover(mode="base")   # Use "accurate" for better quality if needed
+# Initialize remover once
+remover = Remover(mode="base")
 
 
 # ======================================================
@@ -87,7 +90,6 @@ def read_excel_mapping(excel_file):
 
         key = base_token(str(key).strip())
 
-        # TEXT
         lines = []
         for col in text_columns:
             val = col.iloc[i]
@@ -99,12 +101,10 @@ def read_excel_mapping(excel_file):
         if lines:
             mapping[key] = lines
 
-        # CATEGORY
         cat = category_series.iloc[i]
         if pd.notna(cat):
             category_map[key] = sanitize(cat)
 
-        # STYLE
         style = style_series.iloc[i]
         if pd.notna(style):
             style_map[key] = sanitize(style)[:3]
@@ -117,6 +117,7 @@ def read_excel_mapping(excel_file):
 # ======================================================
 
 def remove_background(image: Image.Image):
+    remover = Remover()
     try:
         image = image.convert("RGB")
         output = remover.process(image)
@@ -127,31 +128,31 @@ def remove_background(image: Image.Image):
         return Image.open(BytesIO(output)).convert("RGBA")
 
     except Exception as e:
-        print("Transparent BG error:", e)
+        print("Transparent BG Error:", e)
         return image.convert("RGBA")
 
 
 # ======================================================
-# FIX IMAGE SIZE (1750 x 1160)
+# RESIZE IMAGE TO FIXED CANVAS
 # ======================================================
 
-def resize_to_canvas(image, bg_color_hex="#FFFFFF"):
+def resize_to_canvas(image, bg_color_hex=None):
     """
-    Resize image proportionally and place it on a fixed 1750x1160 canvas.
-    Keeps aspect ratio and centers the jewellery.
+    bg_color_hex = None  -> Transparent canvas.
+    bg_color_hex = "#FFFFFF" -> White background canvas.
     """
-    bg_color = hex_to_rgb(bg_color_hex)
 
     if image.mode != "RGBA":
         image = image.convert("RGBA")
 
-    # Keep aspect ratio
     image.thumbnail((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
 
-    # Create canvas
-    canvas = Image.new("RGB", (TARGET_WIDTH, TARGET_HEIGHT), bg_color)
+    if bg_color_hex:
+        bg = hex_to_rgb(bg_color_hex)
+        canvas = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), bg + (255,))
+    else:
+        canvas = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0, 0))
 
-    # Center image
     x = (TARGET_WIDTH - image.width) // 2
     y = (TARGET_HEIGHT - image.height) // 2
 
@@ -206,21 +207,23 @@ def process_images(request):
     if not style_base:
         style_base = os.path.join("media", "StyleBio")
 
+    transparent_base = os.path.join("media", "Transparent")
+
     os.makedirs(itemwise_base, exist_ok=True)
     os.makedirs(style_base, exist_ok=True)
+    os.makedirs(transparent_base, exist_ok=True)
 
     mapping, category_map, style_map = read_excel_mapping(excel_file)
 
     results = []
 
     for img_file in images:
+
         try:
             filename = img_file.name
             ext = os.path.splitext(filename)[1].lower()
+            name = os.path.splitext(filename)[0]
 
-            # ------------------------------------------
-            # Check Supported Extension
-            # ------------------------------------------
             if ext not in SUPPORTED_EXTS:
                 results.append({
                     "file": filename,
@@ -228,13 +231,6 @@ def process_images(request):
                     "reason": f"Unsupported extension ({ext})"
                 })
                 continue
-
-            name = os.path.splitext(filename)[0]
-
-            # ------------------------------------------
-            # REMOVED: _1 check - now accepts all images
-            # ------------------------------------------
-            # Process all images regardless of _1 suffix
 
             key = base_token(name)
             lines = mapping.get(key)
@@ -247,43 +243,56 @@ def process_images(request):
                 })
                 continue
 
-            # ------------------------------------------
+            # ---------------------------# ---------------------------
             # Load Image
-            # ------------------------------------------
-            im = Image.open(img_file)
-            im = ImageOps.exif_transpose(im).convert("RGB")
+            # ---------------------------
+            im = Image.open(img_file).convert("RGB")
 
-            # ------------------------------------------
-            # Remove Background
-            # ------------------------------------------
-            try:
-                im = remove_background(im)
-            except Exception as e:
-                print("Background removal failed:", e)
-                im = im.convert("RGBA")
+            # ---------------------------
+            # Remove Background (HF Model)
+            # ---------------------------
+            transparent_im = remove_background(im)
 
-            # ------------------------------------------
-            # Resize to 1750 x 1160
-            # ------------------------------------------
-            im = resize_to_canvas(im, bg_color_hex)
+            # Ensure RGBA
+            if transparent_im.mode != "RGBA":
+                transparent_im = transparent_im.convert("RGBA")
 
-            # ------------------------------------------
-            # Preview before adding text
-            # ------------------------------------------
-            preview = image_to_base64(im)
+            # ---------------------------
+            # Transparent Canvas
+            # ---------------------------
+            transparent_canvas = resize_to_canvas(transparent_im, None)
 
-            # ------------------------------------------
-            # Draw Text
-            # ------------------------------------------
-            im = draw_text(im, lines)
+            # ---------------------------
+            # White Canvas
+            # ---------------------------
+            white_canvas = resize_to_canvas(transparent_im, bg_color_hex)
+            
 
-            # ------------------------------------------
-            # Save Format
-            # ------------------------------------------
+            preview = image_to_base64(white_canvas)
+
+            # Add text only on white image
+            white_canvas = draw_text(white_canvas, lines)
+
+            # ---------------------------
+            # Save Transparent PNG
+            # ---------------------------
+            transparent_path = os.path.join(
+                transparent_base,
+                name + ".png"
+            )
+
+            transparent_canvas.save(
+                transparent_path,
+                format="PNG",
+                optimize=True,
+                dpi=(300, 300)
+            )
+
+            # ---------------------------
+            # Save White Image
+            # ---------------------------
             if ext in (".jpg", ".jpeg"):
                 save_format = "JPEG"
-            elif ext == ".png":
-                save_format = "PNG"
             elif ext == ".webp":
                 save_format = "WEBP"
             elif ext == ".bmp":
@@ -291,51 +300,44 @@ def process_images(request):
             else:
                 save_format = "PNG"
 
-            # ------------------------------------------
-            # Save Category Image
-            # ------------------------------------------
             category = category_map.get(key, "Others")
-            cat_dir = os.path.join(itemwise_base, category)
-            os.makedirs(cat_dir, exist_ok=True)
-
-            cat_path = os.path.join(cat_dir, filename)
-
-            if not os.path.exists(cat_path):
-                im.save(
-                    cat_path,
-                    format=save_format,
-                    quality=100,
-                    dpi=(300, 300),
-                    optimize=True
-                )
-
-            # ------------------------------------------
-            # Save Style Image
-            # ------------------------------------------
             style = style_map.get(key, "OTH")
+
+            cat_dir = os.path.join(itemwise_base, category)
             style_dir = os.path.join(style_base, style)
+
+            os.makedirs(cat_dir, exist_ok=True)
             os.makedirs(style_dir, exist_ok=True)
 
+            cat_path = os.path.join(cat_dir, filename)
             style_path = os.path.join(style_dir, filename)
 
-            if not os.path.exists(style_path):
-                im.save(
-                    style_path,
-                    format=save_format,
-                    quality=100,
-                    dpi=(300, 300),
-                    optimize=True
-                )
+            white_canvas.convert("RGB").save(
+                cat_path,
+                format=save_format,
+                quality=100,
+                optimize=True,
+                dpi=(300, 300)
+            )
 
-            # ------------------------------------------
-            # Success Response
-            # ------------------------------------------
+            white_canvas.convert("RGB").save(
+                style_path,
+                format=save_format,
+                quality=100,
+                optimize=True,
+                dpi=(300, 300)
+            )
+
+            # ---------------------------
+            # API Response
+            # ---------------------------
             results.append({
                 "file": filename,
                 "status": "success",
                 "preview": preview,
                 "category": category,
                 "style": style,
+                "transparent_path": transparent_path,
                 "category_path": cat_path,
                 "stylebio_path": style_path
             })
