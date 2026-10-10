@@ -1,0 +1,73 @@
+{
+  "preset_name": "jewellery_image",
+  "enabled": true,
+  "input": {
+    "allowed_formats": [
+      "jpg",
+      "jpeg",
+      "png",
+      "webp"
+    ],
+    "max_file_size_mb": 20,
+    "min_resolution_px": 500
+  },
+  "background_removal": {
+    "enabled": true,
+    "method": "ai_background_removal",
+    "output_background": "transparent",
+    "fallback_background": "#FFFFFF",
+    "preserve_product_edges": true,
+    "preserve_diamond_facets": true,
+    "preserve_prongs_and_claws": true,
+    "preserve_chain_details": true,
+    "preserve_small_components": true,
+    "remove_background_shadows": true,
+    "preserve_natural_product_shadows": false,
+    "remove_reflections": false
+  },
+  "product_protection": {
+    "preserve_original_shape": true,
+    "preserve_original_color": true,
+    "preserve_gold_tone": true,
+    "preserve_diamond_color": true,
+    "preserve_gemstone_color": true,
+    "preserve_stone_count": true,
+    "preserve_setting_details": true,
+    "no_product_redesign": true,
+    "no_artificial_gemstones": true,
+    "no_detail_smoothing": true,
+    "preserve_facet_boundaries": true,
+    "no_artificial_sparkle": true,
+    "alpha_floor": 0
+  },
+  "image_processing": {
+    "auto_crop": true,
+    "crop_mode": "product_centered",
+    "maintain_aspect_ratio": true,
+    "add_padding": true,
+    "padding_percent": 10,
+    "auto_rotate": true,
+    "sharpen": false,
+    "denoise": false,
+    "brightness_adjustment": false,
+    "contrast_adjustment": false,
+    "saturation_adjustment": false
+  },
+  "output": {
+    "format": "png",
+    "width_px": 1750,
+    "height_px": 1160,
+    "resize_mode": "contain",
+    "background_color": "transparent",
+    "color_mode": "RGBA",
+    "preserve_transparency": true,
+    "output_folder": "processed/jewellery"
+  },
+  "validation": {
+    "reject_corrupt_images": true,
+    "warn_if_product_is_cut_off": true,
+    "warn_if_product_is_blurry": true,
+    "warn_if_multiple_products_detected": false,
+    "require_product_visible": true
+  }
+}
