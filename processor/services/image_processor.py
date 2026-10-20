@@ -533,7 +533,7 @@ def sanitize(name):
 
 def image_to_base64(img):
     buffer = BytesIO()
-    img.save(buffer, format="PNG")
+    img.save(buffer, format="PNG", compress_level=1)
     return base64.b64encode(buffer.getvalue()).decode()
 
 
@@ -545,6 +545,18 @@ def hex_to_rgb(hex_color):
     return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
 
+def resolve_output_directory(directory: str | os.PathLike, default_relative: str) -> Path:
+    """Resolve an output directory against the project root and create it."""
+    value = str(directory or default_relative).strip()
+    path = Path(value).expanduser()
+
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 # ======================================================
 # EXCEL READER
 # ======================================================
@@ -553,7 +565,7 @@ def read_excel_mapping(excel_file):
     df = pd.read_excel(excel_file, engine="openpyxl", dtype=str)
     df.columns = [str(c).strip().upper() for c in df.columns]
 
-    key_series = get_series(df, "N")
+    key_series = get_series(df, "F")
     text_columns = [get_series(df, chr(c)) for c in range(ord("E"), ord("K") + 1)]
     category_series = get_series(df, "B")
     style_series = get_series(df, "E")
@@ -734,17 +746,18 @@ def process_images(request):
     if not images:
         raise Exception("Images are required")
 
-    if not itemwise_base:
-        itemwise_base = os.path.join("media", "Itemwise")
-
-    if not style_base:
-        style_base = os.path.join("media", "StyleBio")
-
-    transparent_base = os.path.join("media", "Transparent")
-
-    os.makedirs(itemwise_base, exist_ok=True)
-    os.makedirs(style_base, exist_ok=True)
-    os.makedirs(transparent_base, exist_ok=True)
+    itemwise_base = resolve_output_directory(
+        itemwise_base,
+        os.path.join("media", "Itemwise"),
+    )
+    style_base = resolve_output_directory(
+        style_base,
+        os.path.join("media", "StyleBio"),
+    )
+    transparent_base = resolve_output_directory(
+        None,
+        os.path.join("media", "Transparent"),
+    )
 
     mapping, category_map, style_map = read_excel_mapping(excel_file)
     results = []
@@ -853,15 +866,12 @@ def process_images(request):
             # ---------------------------
             # Save Transparent PNG
             # ---------------------------
-            transparent_path = os.path.join(
-                transparent_base,
-                name + ".png"
-            )
+            transparent_path = transparent_base / f"{name}.png"
 
             transparent_canvas.save(
                 transparent_path,
                 format="PNG",
-                optimize=True,
+                compress_level=1,
                 dpi=(300, 300)
             )
 
@@ -877,32 +887,37 @@ def process_images(request):
             else:
                 save_format = "PNG"
 
+            save_options = {"dpi": (300, 300)}
+            if save_format == "PNG":
+                save_options["compress_level"] = 1
+            elif save_format == "JPEG":
+                save_options.update({"quality": 100, "optimize": False})
+            elif save_format == "WEBP":
+                save_options.update({"quality": 100, "method": 0})
+
             category = category_map.get(key, "Others")
             style = style_map.get(key, "OTH")
 
-            cat_dir = os.path.join(itemwise_base, category)
-            style_dir = os.path.join(style_base, style)
+            cat_dir = itemwise_base / category
+            style_dir = style_base / style
 
-            os.makedirs(cat_dir, exist_ok=True)
-            os.makedirs(style_dir, exist_ok=True)
+            cat_dir.mkdir(parents=True, exist_ok=True)
+            style_dir.mkdir(parents=True, exist_ok=True)
 
-            cat_path = os.path.join(cat_dir, filename)
-            style_path = os.path.join(style_dir, filename)
+            cat_path = cat_dir / filename
+            style_path = style_dir / filename
+            white_rgb = white_canvas.convert("RGB")
 
-            white_canvas.convert("RGB").save(
+            white_rgb.save(
                 cat_path,
                 format=save_format,
-                quality=100,
-                optimize=True,
-                dpi=(300, 300)
+                **save_options,
             )
 
-            white_canvas.convert("RGB").save(
+            white_rgb.save(
                 style_path,
                 format=save_format,
-                quality=100,
-                optimize=True,
-                dpi=(300, 300)
+                **save_options,
             )
 
             # ---------------------------
@@ -915,9 +930,9 @@ def process_images(request):
                 "category": category,
                 "style": style,
                 "preset": preset_name,
-                "transparent_path": transparent_path,
-                "category_path": cat_path,
-                "stylebio_path": style_path
+                "transparent_path": str(transparent_path),
+                "category_path": str(cat_path),
+                "stylebio_path": str(style_path)
             })
 
         except Exception as e:
