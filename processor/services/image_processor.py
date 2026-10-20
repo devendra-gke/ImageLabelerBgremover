@@ -348,6 +348,98 @@ def preserve_original_product_pixels(
     return Image.fromarray(output, mode="RGBA")
 
 
+def apply_reference_matte(
+    original: Image.Image,
+    matte_path: str | os.PathLike,
+    use_reference_rgb: bool = False,
+    repair_regions: list | None = None,
+) -> Image.Image:
+    """Apply a reference cutout and optionally recover source details in ROIs."""
+    source = original.convert("RGB")
+    reference_path = Path(matte_path)
+
+    if not reference_path.is_absolute():
+        reference_path = PROJECT_ROOT / reference_path
+
+    if not reference_path.is_file():
+        raise FileNotFoundError(
+            f"Reference matte not found: {reference_path}"
+        )
+
+    with Image.open(reference_path) as reference_image:
+        reference = reference_image.convert("RGBA")
+        source_ratio = source.width / source.height
+        reference_ratio = reference.width / reference.height
+
+        if abs(source_ratio - reference_ratio) > 0.02:
+            raise ValueError(
+                "Reference matte aspect ratio does not match the source image."
+            )
+
+        reference = reference.resize(source.size, Image.Resampling.LANCZOS)
+
+    if use_reference_rgb:
+        result = reference.copy()
+    else:
+        result = source.convert("RGBA")
+        result.putalpha(reference.getchannel("A"))
+
+    if repair_regions:
+        source_rgb = np.asarray(source, dtype=np.float32)
+        output = np.asarray(result, dtype=np.uint8).copy()
+        height, width = source_rgb.shape[:2]
+
+        for region in repair_regions:
+            if not isinstance(region, (list, tuple)) or len(region) != 4:
+                continue
+
+            left, top, right, bottom = (float(value) for value in region)
+            x1 = min(max(round(left * width), 0), width)
+            y1 = min(max(round(top * height), 0), height)
+            x2 = min(max(round(right * width), x1), width)
+            y2 = min(max(round(bottom * height), y1), height)
+            if x1 >= x2 or y1 >= y2:
+                continue
+
+            crop = source_rgb[y1:y2, x1:x2]
+
+            # The source photos use a near-white background. Build a local
+            # soft matte and restrict it to the explicitly marked ROIs.
+            deviation = 255.0 - np.min(crop, axis=2)
+            low = 5.0
+            high = 38.0
+            recovered_alpha = np.clip(
+                (deviation - low) * (255.0 / (high - low)),
+                0,
+                255,
+            ).astype(np.uint8)
+
+            existing_alpha = output[y1:y2, x1:x2, 3]
+            restore = recovered_alpha > existing_alpha
+            if not np.any(restore):
+                continue
+
+            alpha = np.maximum(existing_alpha, recovered_alpha).astype(np.float32)
+            alpha_fraction = np.maximum(alpha / 255.0, 0.12)[..., None]
+
+            # Remove the source's white backdrop from recovered edge colors.
+            decontaminated = (
+                crop - (1.0 - alpha_fraction) * 255.0
+            ) / alpha_fraction
+            decontaminated = np.clip(decontaminated, 0, 255).astype(np.uint8)
+
+            rgb_roi = output[y1:y2, x1:x2, :3]
+            rgb_roi[restore] = decontaminated[restore]
+            output[y1:y2, x1:x2, 3] = np.maximum(
+                existing_alpha,
+                recovered_alpha,
+            )
+
+        result = Image.fromarray(output, mode="RGBA")
+
+    return result
+
+
 
 
 def load_preset_settings(preset_name: str | None = None, base_dir: str | os.PathLike | None = None):
@@ -682,6 +774,24 @@ def process_images(request):
             key = base_token(name)
             lines = mapping.get(key)
 
+            per_image_overrides = preset.get("per_image_overrides", {})
+            item_override = {}
+            if isinstance(per_image_overrides, dict):
+                item_override = per_image_overrides.get(key)
+                if isinstance(item_override, dict):
+                    pp_override = item_override.get("product_protection", {})
+                    if isinstance(pp_override, dict) and pp_override:
+                        product_protection = {
+                            **product_protection,
+                            **pp_override,
+                        }
+                    output_override = item_override.get("output", {})
+                    if isinstance(output_override, dict) and output_override:
+                        output_settings = {
+                            **output_settings,
+                            **output_override,
+                        }
+
             if not lines:
                 results.append({
                     "file": filename,
@@ -698,11 +808,27 @@ def process_images(request):
             # ---------------------------
             # Remove background and preserve product colour
             # ---------------------------
-            transparent_im = remove_background(
-                im,
-                bg_settings=bg_settings,
-                product_protection=product_protection,
+            reference_matte = (
+                item_override.get("reference_matte")
+                if isinstance(item_override, dict)
+                else None
             )
+
+            if reference_matte:
+                transparent_im = apply_reference_matte(
+                    im,
+                    reference_matte,
+                    use_reference_rgb=bool(
+                        item_override.get("use_reference_rgb", False)
+                    ),
+                    repair_regions=item_override.get("repair_regions"),
+                )
+            else:
+                transparent_im = remove_background(
+                    im,
+                    bg_settings=bg_settings,
+                    product_protection=product_protection,
+                )
 
             width = int(output_settings.get("width_px", TARGET_WIDTH) or TARGET_WIDTH)
             height = int(output_settings.get("height_px", TARGET_HEIGHT) or TARGET_HEIGHT)

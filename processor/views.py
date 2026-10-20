@@ -52,3 +52,35 @@ class ImageProcessAPI(View):
             return JsonResponse({
                 "error": str(e)
             }, status=500)
+
+
+class SelectOutputFolderAPI(View):
+    """Open a native folder picker for the local Windows application."""
+
+    def post(self, request):
+        if request.META.get("REMOTE_ADDR") not in {"127.0.0.1", "::1"}:
+            return JsonResponse({"error": "Folder selection is local-only."}, status=403)
+
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            selected_folder = filedialog.askdirectory(
+                parent=root,
+                title="Choose output folder",
+                mustexist=True,
+            )
+            root.destroy()
+
+            return JsonResponse({
+                "path": selected_folder,
+                "cancelled": not bool(selected_folder),
+            })
+        except Exception as exc:
+            return JsonResponse(
+                {"error": f"Could not open the folder picker: {exc}"},
+                status=500,
+            )

@@ -42,12 +42,15 @@
     "alpha_floor": 24,
     "edge_recovery": false,
     "highlight_alpha_recovery": true,
-    "highlight_threshold": 220,
-    "alpha_expand_px": 2,
+    "highlight_threshold": 212,
+    "alpha_expand_px": 3,
+    "sparkle_min_alpha": 214,
+    "recover_zero_alpha_sparkle": true,
+    "zero_alpha_seed": 24,
     "max_edge_cleanup": 0.08,
     "facet_edge_threshold": 18,
-    "facet_brightness_threshold": 145,
-    "facet_min_alpha": 190
+    "facet_brightness_threshold": 138,
+    "facet_min_alpha": 202
   },
   "image_processing": {
     "auto_crop": true,

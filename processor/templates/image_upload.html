@@ -344,6 +344,21 @@
         }
         input[type="text"]::placeholder { color: var(--muted); opacity: 0.7; }
 
+        .path-picker { display: flex; gap: 8px; }
+        .path-picker input { min-width: 0; flex: 1; }
+        .path-picker button {
+            flex: 0 0 auto;
+            padding: 0 14px;
+            border: 1px solid var(--border-hi);
+            border-radius: 8px;
+            background: rgba(59,95,224,0.08);
+            color: var(--blue-hi);
+            font: 600 11px 'Space Mono', monospace;
+            cursor: pointer;
+        }
+        .path-picker button:hover { background: rgba(59,95,224,0.16); }
+        .path-picker button:disabled { opacity: 0.6; cursor: wait; }
+
         /* ── COLOR PICKER ── */
         .color-row { display: flex; align-items: center; gap: 14px; }
         .color-swatch-wrap {
@@ -652,13 +667,6 @@
         <div class="card">
             <div class="grid-2" style="margin-bottom:22px">
                 <div class="field">
-                    <div class="field-label">PRODUCT TYPE</div>
-                    <select name="preset" style="width:100%;padding:12px 14px;border-radius:12px;border:1px solid rgba(148,163,184,0.3);background:rgba(15,23,42,0.6);color:#e2e8f0;">
-                        <option value="jewellery">Jewellery</option>
-                        <option value="diamond">Diamond</option>
-                    </select>
-                </div>
-                <div class="field">
                     <div class="field-label">BACKGROUND COLOR</div>
                     <div class="color-row">
                         <div class="color-swatch-wrap">
@@ -676,11 +684,17 @@
             <div class="grid-2" style="margin-bottom:22px">
                 <div class="field">
                     <div class="field-label">ITEMWISE FOLDER PATH</div>
-                    <input type="text" name="itemwise_folder" placeholder="media/Itemwise">
+                    <div class="path-picker">
+                        <input type="text" id="itemwiseFolder" name="itemwise_folder" placeholder="media/Itemwise">
+                        <button type="button" onclick="chooseOutputFolder('itemwiseFolder', this)">Browse</button>
+                    </div>
                 </div>
                 <div class="field">
                     <div class="field-label">STYLEBIO FOLDER PATH</div>
-                    <input type="text" name="stylebio_folder" placeholder="media/StyleBio">
+                    <div class="path-picker">
+                        <input type="text" id="stylebioFolder" name="stylebio_folder" placeholder="media/StyleBio">
+                        <button type="button" onclick="chooseOutputFolder('stylebioFolder', this)">Browse</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -736,6 +750,33 @@
 function getCSRFToken() {
     const el = document.querySelector('[name=csrfmiddlewaretoken]');
     return el ? el.value : '';
+}
+
+async function chooseOutputFolder(inputId, button) {
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = "Opening…";
+
+    try {
+        const response = await fetch("/select-output-folder/", {
+            method: "POST",
+            headers: { "X-CSRFToken": getCSRFToken() }
+        });
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.error || "Unable to open folder picker.");
+        }
+
+        if (result.path) {
+            document.getElementById(inputId).value = result.path;
+        }
+    } catch (error) {
+        alert(error.message || "Unable to open folder picker.");
+    } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+    }
 }
 
 // ── FILE NAME DISPLAY ──

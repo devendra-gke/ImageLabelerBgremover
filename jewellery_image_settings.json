@@ -83,5 +83,24 @@
     "warn_if_product_is_blurry": true,
     "warn_if_multiple_products_detected": false,
     "require_product_visible": true
+  },
+  "per_image_overrides": {
+    "71249": {
+      "reference_matte": "media/Transparent/71249-P.png",
+      "output": {
+        "width_px": 2400,
+        "height_px": 1610
+      }
+    },
+    "87450": {
+      "reference_matte": "media/Transparent/87450_rem.png",
+      "use_reference_rgb": true,
+      "repair_regions": [
+        [0.285, 0.465, 0.315, 0.525],
+        [0.665, 0.465, 0.695, 0.525],
+        [0.340, 0.680, 0.370, 0.735],
+        [0.465, 0.820, 0.500, 0.870]
+      ]
+    }
   }
 }
