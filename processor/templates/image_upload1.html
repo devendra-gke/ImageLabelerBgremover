@@ -681,26 +681,35 @@
         <div class="card">
             <div class="grid-2" style="margin-bottom:24px">
                 <div class="field">
+                    <div class="field-label"><span>◆</span> Product Type</div>
+                    <select name="preset" style="width:100%;padding:12px 14px;border-radius:12px;border:1px solid rgba(148,163,184,0.3);background:rgba(15,23,42,0.6);color:#e2e8f0;">
+                        <option value="jewellery">Jewellery</option>
+                        <option value="diamond">Diamond</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <div class="field-label"><span>◆</span> Background Color</div>
+                    <div class="color-row">
+                        <div class="color-swatch-wrap">
+                            <div class="color-preview" id="colorPreview"></div>
+                            <input type="color" id="bgColor" name="bg_color">
+                        </div>
+                        <div class="color-info">
+                            <div class="color-hex" id="colorHex">#000000</div>
+                            <div class="color-label">Hex Value</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="grid-2" style="margin-bottom:24px">
+                <div class="field">
                     <div class="field-label"><span>◆</span> Itemwise Folder Path</div>
                     <input type="text" name="itemwise_folder" placeholder="media/Itemwise">
                 </div>
                 <div class="field">
                     <div class="field-label"><span>◆</span> StyleBio Folder Path</div>
                     <input type="text" name="stylebio_folder" placeholder="media/StyleBio">
-                </div>
-            </div>
-
-            <div class="field">
-                <div class="field-label"><span>◆</span> Background Color</div>
-                <div class="color-row">
-                    <div class="color-swatch-wrap">
-                        <div class="color-preview" id="colorPreview"></div>
-                        <input type="color" id="bgColor" name="bg_color">
-                    </div>
-                    <div class="color-info">
-                        <div class="color-hex" id="colorHex">#000000</div>
-                        <div class="color-label">Hex Value</div>
-                    </div>
                 </div>
             </div>
         </div>

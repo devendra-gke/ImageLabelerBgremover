@@ -14,6 +14,8 @@
   "background_removal": {
     "enabled": true,
     "method": "ai_background_removal",
+    "backend": "huggingface",
+    "fallback_to_local": true,
     "output_background": "transparent",
     "fallback_background": "#FFFFFF",
     "preserve_product_edges": true,
@@ -37,7 +39,15 @@
     "preserve_stone_count": true,
     "preserve_setting_details": true,
     "preserve_gold_tone": true,
-    "alpha_floor": 0
+    "alpha_floor": 24,
+    "edge_recovery": false,
+    "highlight_alpha_recovery": true,
+    "highlight_threshold": 220,
+    "alpha_expand_px": 2,
+    "max_edge_cleanup": 0.08,
+    "facet_edge_threshold": 18,
+    "facet_brightness_threshold": 145,
+    "facet_min_alpha": 190
   },
   "image_processing": {
     "auto_crop": true,

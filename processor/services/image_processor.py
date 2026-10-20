@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from transparent_background import Remover
+import os
+from huggingface_hub import InferenceClient
  
 ssl._create_default_https_context = ssl._create_unverified_context
 print("ssl done")
@@ -18,6 +20,17 @@ print("ssl done")
 # ======================================================
 # CONFIGURATION
 # ======================================================
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+HF_SEGMENTATION_MODEL = os.getenv(
+    "HF_SEGMENTATION_MODEL",
+    "briaai/RMBG-1.4",
+)
+
+BACKGROUND_REMOVAL_BACKEND = os.getenv(
+    "BACKGROUND_REMOVAL_BACKEND",
+    "local",
+).lower()
 
 SUPPORTED_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 WINDOWS_TREBUCHET = r"C:\Windows\Fonts\trebuc.ttf"
@@ -41,6 +54,300 @@ remover = Remover(mode="base")
 # ======================================================
 # HELPERS
 # ======================================================
+
+
+import numpy as np
+from PIL import Image, ImageFilter
+from io import BytesIO
+
+
+
+def remove_background_huggingface(image: Image.Image) -> Image.Image:
+    """
+    Use a Hugging Face image-segmentation model to generate
+    an alpha mask. The original jewellery RGB pixels are retained.
+
+    HF_SEGMENTATION_MODEL must identify a compatible segmentation
+    model, not an image-generation model such as Qwen-Image.
+    """
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is not configured.")
+
+    if not HF_SEGMENTATION_MODEL:
+        raise RuntimeError(
+            "HF_SEGMENTATION_MODEL is not configured."
+        )
+
+    client = InferenceClient(
+        model=HF_SEGMENTATION_MODEL,
+        token=HF_TOKEN,
+        timeout=120,
+    )
+
+    source = image.convert("RGB")
+    predictions = client.image_segmentation(source)
+
+    if not predictions:
+        raise RuntimeError(
+            "The segmentation model returned no masks."
+        )
+
+    candidates = []
+
+    for prediction in predictions:
+        if isinstance(prediction, dict):
+            label = str(prediction.get("label", "")).lower()
+            mask = prediction.get("mask")
+            score = float(prediction.get("score", 0.0))
+        else:
+            label = str(
+                getattr(prediction, "label", "")
+            ).lower()
+            mask = getattr(prediction, "mask", None)
+            score = float(
+                getattr(prediction, "score", 0.0)
+            )
+
+        if mask is None:
+            continue
+
+        if not isinstance(mask, Image.Image):
+            mask = Image.fromarray(np.asarray(mask))
+
+        mask = mask.convert("L").resize(
+            source.size,
+            Image.Resampling.LANCZOS,
+        )
+
+        # This helper expects a foreground mask.
+        # Do not silently invert masks without checking the model's
+        # documented label semantics.
+        if label in {"background", "bg"}:
+            mask = Image.eval(mask, lambda value: 255 - value)
+        elif label in {"", "foreground", "object", "product"}:
+            pass
+        else:
+            # Unknown labels may describe other objects or classes.
+            continue
+
+        candidates.append((score, mask))
+
+    if not candidates:
+        raise RuntimeError(
+            "No usable foreground mask was returned. "
+            "Check the model's output labels and documentation."
+        )
+
+    _, foreground_mask = max(
+        candidates,
+        key=lambda item: item[0],
+    )
+
+    rgba = source.convert("RGBA")
+    rgba.putalpha(foreground_mask)
+    return rgba
+
+
+
+def preserve_original_product_pixels(
+    original: Image.Image,
+    processed: Image.Image,
+    product_protection: dict | None = None,
+) -> Image.Image:
+    """
+    Preserve original jewellery colours and shine.
+    Keep source RGB and model alpha, with optional conservative edge cleanup.
+    """
+    product_protection = product_protection or {}
+
+    source = original.convert("RGB")
+    result = processed.convert("RGBA")
+
+    if result.size != source.size:
+        result = result.resize(
+            source.size,
+            Image.Resampling.LANCZOS
+        )
+
+    src = np.asarray(source, dtype=np.float32)
+    rgba = np.asarray(result, dtype=np.float32).copy()
+
+    alpha_u8 = rgba[..., 3].astype(np.uint8)
+    initial_alpha_u8 = alpha_u8.copy()
+    alpha = alpha_u8 / 255.0
+
+    # Start with the original image colour so stone tones stay intact.
+    output_rgb = src.copy()
+
+    edge_recovery = bool(product_protection.get("edge_recovery", False))
+
+    if edge_recovery:
+        height, width = alpha.shape
+        border_size = max(5, min(height, width) // 100)
+
+        border_pixels = np.concatenate([
+            src[:border_size, :, :].reshape(-1, 3),
+            src[-border_size:, :, :].reshape(-1, 3),
+            src[:, :border_size, :].reshape(-1, 3),
+            src[:, -border_size:, :].reshape(-1, 3),
+        ])
+
+        background_rgb = np.median(border_pixels, axis=0)
+
+        # Focus only on uncertain transition pixels.
+        edge = (alpha >= 0.35) & (alpha < 0.98)
+
+        if np.any(edge):
+            # Protect bright highlight pixels to preserve diamond sparkle.
+            highlight_threshold = float(
+                product_protection.get("highlight_threshold", 228)
+            )
+            highlight_mask = np.max(src, axis=2) >= highlight_threshold
+            eligible = edge & (~highlight_mask)
+
+            if np.any(eligible):
+                a = np.maximum(alpha[eligible, None], 0.35)
+                corrected = (
+                    src[eligible]
+                    - (1.0 - a) * background_rgb[None, :]
+                ) / a
+
+                corrected = np.clip(corrected, 0, 255)
+
+                # Keep edge cleanup mild so gem colors are not flattened.
+                max_edge_cleanup = float(
+                    product_protection.get("max_edge_cleanup", 0.18)
+                )
+                max_edge_cleanup = min(max(max_edge_cleanup, 0.0), 0.35)
+
+                correction_strength = (
+                    (1.0 - alpha[eligible]) * max_edge_cleanup
+                )[:, None]
+
+                output_rgb[eligible] = (
+                    src[eligible] * (1.0 - correction_strength)
+                    + corrected * correction_strength
+                )
+
+    alpha_floor = int(product_protection.get("alpha_floor", 0) or 0)
+    alpha_floor = min(max(alpha_floor, 0), 255)
+
+    if alpha_floor > 0:
+        nonzero = alpha_u8 > 0
+        alpha_u8[nonzero] = np.maximum(alpha_u8[nonzero], alpha_floor)
+
+    alpha_expand_px = int(product_protection.get("alpha_expand_px", 1))
+    alpha_expand_px = min(max(alpha_expand_px, 0), 4)
+
+    if alpha_expand_px > 0:
+        kernel = (alpha_expand_px * 2) + 1
+        expanded_alpha = np.asarray(
+            Image.fromarray(alpha_u8, mode="L").filter(
+                ImageFilter.MaxFilter(size=kernel)
+            ),
+            dtype=np.uint8,
+        )
+    else:
+        expanded_alpha = alpha_u8.copy()
+
+    # Recover tiny bright facets and specular highlights that can become
+    # overly transparent in segmentation masks.
+    if product_protection.get("preserve_diamond_color", True):
+        highlight_alpha_recovery = bool(
+            product_protection.get("highlight_alpha_recovery", True)
+        )
+
+        if highlight_alpha_recovery:
+            highlight_threshold = int(
+                product_protection.get("highlight_threshold", 228)
+            )
+            sparkle_min_alpha = int(
+                product_protection.get("sparkle_min_alpha", 205)
+            )
+            sparkle_min_alpha = min(max(sparkle_min_alpha, 0), 255)
+
+            # Bright pixels near uncertain edges are likely real sparkle,
+            # so raise alpha there using a localized expanded mask.
+            sparkle = np.max(src, axis=2) >= highlight_threshold
+            uncertain = alpha_u8 < 245
+            keep_mask = sparkle & uncertain & (expanded_alpha > 0)
+
+            boosted = np.minimum(expanded_alpha, sparkle_min_alpha)
+
+            alpha_u8[keep_mask] = np.maximum(
+                alpha_u8[keep_mask],
+                boosted[keep_mask],
+            )
+
+            # Recover zero-alpha sparkle pixels only when close to the
+            # original matte, preventing distant background bleed.
+            if product_protection.get("recover_zero_alpha_sparkle", True):
+                zero_seed_alpha = int(
+                    product_protection.get("zero_alpha_seed", 28)
+                )
+                zero_seed_alpha = min(max(zero_seed_alpha, 1), 255)
+                recover_zero = (
+                    sparkle
+                    & (initial_alpha_u8 == 0)
+                    & (expanded_alpha >= zero_seed_alpha)
+                )
+                alpha_u8[recover_zero] = np.maximum(
+                    alpha_u8[recover_zero],
+                    boosted[recover_zero],
+                )
+
+    if product_protection.get("preserve_facet_boundaries", True):
+        # Preserve thin prongs and facet edges that segmentation can fade.
+        gray = (
+            (0.299 * src[..., 0])
+            + (0.587 * src[..., 1])
+            + (0.114 * src[..., 2])
+        ).astype(np.uint8)
+
+        edge_map = np.asarray(
+            Image.fromarray(gray, mode="L").filter(ImageFilter.FIND_EDGES),
+            dtype=np.uint8,
+        )
+
+        facet_edge_threshold = int(
+            product_protection.get("facet_edge_threshold", 20)
+        )
+        facet_brightness_threshold = int(
+            product_protection.get("facet_brightness_threshold", 150)
+        )
+        facet_min_alpha = int(
+            product_protection.get("facet_min_alpha", 185)
+        )
+
+        facet_edge_threshold = min(max(facet_edge_threshold, 1), 255)
+        facet_brightness_threshold = min(
+            max(facet_brightness_threshold, 0),
+            255,
+        )
+        facet_min_alpha = min(max(facet_min_alpha, 0), 255)
+
+        uncertain = alpha_u8 < facet_min_alpha
+        facet_mask = (
+            uncertain
+            & (edge_map >= facet_edge_threshold)
+            & (gray >= facet_brightness_threshold)
+            & (expanded_alpha > 0)
+        )
+
+        alpha_u8[facet_mask] = np.maximum(
+            alpha_u8[facet_mask],
+            np.minimum(expanded_alpha[facet_mask], facet_min_alpha),
+        )
+
+    # Preserve the model's alpha mask; do not hard-threshold it.
+    output = np.dstack([
+        np.clip(output_rgb, 0, 255).astype(np.uint8),
+        alpha_u8
+    ])
+
+    return Image.fromarray(output, mode="RGBA")
+
+
 
 
 def load_preset_settings(preset_name: str | None = None, base_dir: str | os.PathLike | None = None):
@@ -88,28 +395,28 @@ def resolve_preset_name(request=None, default_name: str = "jewellery", filename:
     return default_name
 
 
-def preserve_original_product_pixels(original: Image.Image, processed: Image.Image) -> Image.Image:
-    """Use the AI result only as an alpha mask and retain source RGB values.
+# def preserve_original_product_pixels(original: Image.Image, processed: Image.Image) -> Image.Image:
+#     """Use the AI result only as an alpha mask and retain source RGB values.
 
-    Do not restore bright pixels outside the mask: those can be background
-    pixels and create white/grey halos around diamonds and fine gold wires.
-    """
-    source = original.convert("RGB")
-    result = processed.convert("RGBA")
+#     Do not restore bright pixels outside the mask: those can be background
+#     pixels and create white/grey halos around diamonds and fine gold wires.
+#     """
+#     source = original.convert("RGB")
+#     result = processed.convert("RGBA")
 
-    if result.size != source.size:
-        result = result.resize(source.size, Image.Resampling.LANCZOS)
+#     if result.size != source.size:
+#         result = result.resize(source.size, Image.Resampling.LANCZOS)
 
-    source_rgb = np.asarray(source, dtype=np.uint8)
-    rgba = np.asarray(result, dtype=np.uint8).copy()
-    alpha = rgba[..., 3].copy()
+#     source_rgb = np.asarray(source, dtype=np.uint8)
+#     rgba = np.asarray(result, dtype=np.uint8).copy()
+#     alpha = rgba[..., 3].copy()
 
-    # Keep the model's original soft alpha edges. Do not hard-threshold them;
-    # tiny diamonds, prongs and thin chain links may occupy only a few pixels.
-    rgba[..., :3] = source_rgb
-    rgba[..., 3] = alpha
-    rgba[alpha == 0, :3] = 0
-    return Image.fromarray(rgba, mode="RGBA")
+#     # Keep the model's original soft alpha edges. Do not hard-threshold them;
+#     # tiny diamonds, prongs and thin chain links may occupy only a few pixels.
+#     rgba[..., :3] = source_rgb
+#     rgba[..., 3] = alpha
+#     rgba[alpha == 0, :3] = 0
+#     return Image.fromarray(rgba, mode="RGBA")
 
 def base_token(s: str) -> str:
     s = (s or "").strip()
@@ -202,42 +509,64 @@ def remove_background(
     bg_settings: dict | None = None,
     product_protection: dict | None = None,
 ):
-    """Remove the background with the shared model and preserve source colour."""
     source = image.convert("RGB")
     bg_settings = bg_settings or {}
     product_protection = product_protection or {}
 
-    if bg_settings.get("enabled", True) is False:
+    if not bg_settings.get("enabled", True):
         return source.convert("RGBA")
 
-    try:
-        # Reuse the model initialized at module import; do not load one per image.
+    selected_backend = str(
+        bg_settings.get("backend") or BACKGROUND_REMOVAL_BACKEND
+    ).strip().lower()
+
+    if selected_backend == "huggingface":
         try:
+            processed = remove_background_huggingface(source)
+        except Exception:
+            if not bg_settings.get("fallback_to_local", True):
+                raise
+
             output = remover.process(source, type="rgba")
-        except TypeError:
-            # Compatibility with transparent_background versions that don't
-            # accept the `type` keyword.
-            output = remover.process(source)
+
+            if isinstance(output, Image.Image):
+                processed = output.convert("RGBA")
+            elif isinstance(output, (bytes, bytearray)):
+                processed = Image.open(
+                    BytesIO(output)
+                ).convert("RGBA")
+            else:
+                processed = Image.fromarray(
+                    np.asarray(output)
+                ).convert("RGBA")
+    else:
+        output = remover.process(source, type="rgba")
 
         if isinstance(output, Image.Image):
             processed = output.convert("RGBA")
         elif isinstance(output, (bytes, bytearray)):
-            processed = Image.open(BytesIO(output)).convert("RGBA")
+            processed = Image.open(
+                BytesIO(output)
+            ).convert("RGBA")
         else:
-            processed = Image.fromarray(np.asarray(output)).convert("RGBA")
+            processed = Image.fromarray(
+                np.asarray(output)
+            ).convert("RGBA")
 
-        if processed.size != source.size:
-            processed = processed.resize(source.size, Image.Resampling.LANCZOS)
+    if processed.size != source.size:
+        processed = processed.resize(
+            source.size,
+            Image.Resampling.LANCZOS,
+        )
 
-        if product_protection.get("preserve_original_color", True):
-            processed = preserve_original_product_pixels(source, processed)
+    if product_protection.get("preserve_original_color", True):
+        processed = preserve_original_product_pixels(
+            source,
+            processed,
+            product_protection=product_protection,
+        )
 
-        return processed
-    except Exception as exc:
-        # Fail visibly instead of silently returning the original image with
-        # its background still present.
-        print("Transparent BG Error:", exc)
-        raise RuntimeError(f"Background removal failed: {exc}") from exc
+    return processed
 
 
 # ======================================================
