@@ -561,21 +561,62 @@ def resolve_output_directory(directory: str | os.PathLike, default_relative: str
 # EXCEL READER
 # ======================================================
 
+def normalize_excel_header(value):
+    return str(value or "").strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+def get_named_series(df, *candidate_names):
+    if df.empty:
+        return None
+
+    normalized_map = {
+        normalize_excel_header(col): col for col in df.columns
+    }
+
+    for candidate in candidate_names:
+        key = normalize_excel_header(candidate)
+        if key in normalized_map:
+            return df[normalized_map[key]]
+
+    return None
+
+
 def read_excel_mapping(excel_file):
     df = pd.read_excel(excel_file, engine="openpyxl", dtype=str)
-    df.columns = [str(c).strip().upper() for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
-    key_series = get_series(df, "F")
-    text_columns = [get_series(df, chr(c)) for c in range(ord("E"), ord("K") + 1)]
-    category_series = get_series(df, "B")
-    style_series = get_series(df, "E")
+    key_series = get_named_series(
+        df,
+        "TAGNO",
+        "TagNo",
+        "Tag No",
+        "tag no",
+        "Image Tag",
+    )
+    category_series = get_named_series(df, "Category", "CATEGORY")
+    style_series = get_named_series(df, "StyleBio", "Style Bio", "STYLEBIO")
+
+    text_field_names = [
+        "StyleBio",
+        "TagNo",
+        "DiaWt",
+        "ChainWt",
+        "ChainWT",
+        "GrossWt",
+        "StoneWt",
+    ]
+    text_columns = []
+    for name in text_field_names:
+        series = get_named_series(df, name)
+        if series is not None:
+            text_columns.append(series)
 
     mapping = {}
     category_map = {}
     style_map = {}
 
     for i in range(len(df)):
-        key = key_series.iloc[i]
+        key = key_series.iloc[i] if key_series is not None else None
 
         if pd.isna(key):
             continue
@@ -593,13 +634,15 @@ def read_excel_mapping(excel_file):
         if lines:
             mapping[key] = lines
 
-        cat = category_series.iloc[i]
-        if pd.notna(cat):
-            category_map[key] = sanitize(cat)
+        if category_series is not None:
+            cat = category_series.iloc[i]
+            if pd.notna(cat):
+                category_map[key] = sanitize(cat)
 
-        style = style_series.iloc[i]
-        if pd.notna(style):
-            style_map[key] = sanitize(style)[:3]
+        if style_series is not None:
+            style = style_series.iloc[i]
+            if pd.notna(style):
+                style_map[key] = sanitize(style)[:3]
 
     return mapping, category_map, style_map
 
@@ -848,10 +891,15 @@ def process_images(request):
             canvas_bg = output_settings.get("background_color", "transparent")
             canvas_color = None if canvas_bg.lower() == "transparent" else canvas_bg
 
-            # ---------------------------
-            # Transparent Canvas
-            # ---------------------------
-            transparent_canvas = resize_to_canvas(transparent_im, None, width, height)
+            # Keep the transparent export at the actual source size.
+            # The fixed canvas size is used only for white/itemwise outputs.
+            original_size = im.size
+            transparent_canvas = transparent_im.convert("RGBA")
+            if transparent_canvas.size != original_size:
+                transparent_canvas = transparent_canvas.resize(
+                    original_size,
+                    Image.Resampling.LANCZOS,
+                )
 
             # ---------------------------
             # White Canvas

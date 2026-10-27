@@ -14,7 +14,7 @@
   "background_removal": {
     "enabled": true,
     "method": "ai_background_removal",
-    "backend": "huggingface",
+    "backend": "local",
     "fallback_to_local": true,
     "output_background": "transparent",
     "fallback_background": "#FFFFFF",

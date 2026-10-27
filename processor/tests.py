@@ -1,10 +1,14 @@
+import io
+
 import numpy as np
+import pandas as pd
 from django.test import TestCase
 from PIL import Image
 
 from processor.services.image_processor import (
     preserve_jewelry_highlights,
     load_preset_settings,
+    read_excel_mapping,
 )
 
 
@@ -46,3 +50,28 @@ class JewelryBackgroundRemovalTests(TestCase):
         self.assertEqual(fixed.getpixel((0, 0))[3], 0)
         self.assertEqual(fixed.getpixel((5, 5))[3], 255)
         self.assertEqual(tuple(fixed.getpixel((5, 5))[:3]), (245, 245, 250))
+
+    def test_excel_mapping_uses_tagno_and_selected_fields(self):
+        df = pd.DataFrame([
+            {
+                "Category": "RING",
+                "StyleBio": "SB-202",
+                "TagNo": "1001",
+                "DiaWt": "0.90",
+                "ChainWt": "0.10",
+                "GrossWt": "12.50",
+                "StoneWt": "1.20",
+                "Remark": "ok",
+                "Description": "gold ring",
+            }
+        ])
+
+        buffer = io.BytesIO()
+        df.to_excel(buffer, index=False)
+        buffer.seek(0)
+
+        mapping, category_map, _ = read_excel_mapping(buffer)
+
+        self.assertIn("1001", mapping)
+        self.assertEqual(mapping["1001"], ["SB-202", "1001", "0.90", "0.10", "12.50", "1.20"])
+        self.assertEqual(category_map["1001"], "RING")
