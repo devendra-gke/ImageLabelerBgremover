@@ -44,6 +44,8 @@ PRESET_FILES = {
     "diamond_image": "diamond_image_settings.json",
     "jewellery": "jewellery_image_settings.json",
     "jewelry": "jewellery_image_settings.json",
+    "necklace": "jewellery_image_settings.json",
+    "haram": "jewellery_image_settings.json",
     "jewellery_image": "jewellery_image_settings.json",
 }
 
@@ -481,7 +483,7 @@ def resolve_preset_name(request=None, default_name: str = "jewellery", filename:
         lowered = filename.lower()
         if "diamond" in lowered:
             return "diamond"
-        if "jewel" in lowered or "jewellery" in lowered:
+        if any(term in lowered for term in ("jewel", "necklace", "haram")):
             return "jewellery"
 
     return default_name
