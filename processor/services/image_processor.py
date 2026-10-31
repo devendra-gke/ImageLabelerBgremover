@@ -608,9 +608,14 @@ def read_excel_mapping(excel_file):
         "StoneWt",
     ]
     text_columns = []
+    seen_headers = set()
     for name in text_field_names:
+        header = normalize_excel_header(name)
+        if header in seen_headers:
+            continue
         series = get_named_series(df, name)
         if series is not None:
+            seen_headers.add(header)
             text_columns.append(series)
 
     mapping = {}
@@ -669,7 +674,30 @@ def remove_background(
         bg_settings.get("backend") or BACKGROUND_REMOVAL_BACKEND
     ).strip().lower()
 
-    if selected_backend == "huggingface":
+    prompt = str(bg_settings.get("prompt") or "").strip()
+
+    if prompt:
+        try:
+            from .prompt_segmenter import segment_by_prompt
+
+            processed = segment_by_prompt(
+                source,
+                prompt,
+                box_threshold=float(bg_settings.get("prompt_box_threshold", 0.3)),
+                text_threshold=float(bg_settings.get("prompt_text_threshold", 0.25)),
+                max_objects=int(bg_settings.get("prompt_max_objects", 5)),
+            )
+        except Exception as exc:
+            if not bg_settings.get("fallback_to_local", True):
+                raise
+            print(f"Prompt segmentation failed ({exc}); using local remover.")
+            output = remover.process(source, type="rgba")
+            processed = (
+                output.convert("RGBA")
+                if isinstance(output, Image.Image)
+                else Image.fromarray(np.asarray(output)).convert("RGBA")
+            )
+    elif selected_backend == "huggingface":
         try:
             processed = remove_background_huggingface(source)
         except Exception:
@@ -715,6 +743,15 @@ def remove_background(
             product_protection=product_protection,
         )
 
+    if bg_settings.get("remove_inner_holes", True):
+        from .hole_cleanup import remove_enclosed_background
+
+        processed = remove_enclosed_background(
+            source,
+            processed,
+            settings=bg_settings,
+        )
+
     return processed
 
 
@@ -755,8 +792,16 @@ def resize_to_canvas(image, bg_color_hex=None, target_width=None, target_height=
 # DRAW TEXT
 # ======================================================
 
-def draw_text(img, lines):
+def draw_text(img, lines, bg_color_hex=None):
     draw = ImageDraw.Draw(img)
+
+    # White text on a light canvas is invisible, so pick black or white
+    # depending on the background brightness.
+    fill = "white"
+    if bg_color_hex:
+        r, g, b = hex_to_rgb(bg_color_hex)
+        if (0.299 * r + 0.587 * g + 0.114 * b) > 140:
+            fill = "black"
 
     try:
         font = ImageFont.truetype(WINDOWS_TREBUCHET, 28)
@@ -767,7 +812,7 @@ def draw_text(img, lines):
     y = img.height - (35 * len(lines)) - 40
 
     for line in lines:
-        draw.text((x, y), line, fill="white", font=font)
+        draw.text((x, y), line, fill=fill, font=font)
         y += 35
 
     return img
@@ -828,6 +873,10 @@ def process_images(request):
             bg_settings = preset.get("background_removal", {})
             product_protection = preset.get("product_protection", {})
             output_settings = preset.get("output", {})
+
+            bg_prompt = (request.POST.get("bg_prompt") or "").strip()
+            if bg_prompt:
+                bg_settings = {**bg_settings, "prompt": bg_prompt}
 
             key = base_token(name)
             lines = mapping.get(key)
@@ -911,7 +960,11 @@ def process_images(request):
             preview = image_to_base64(white_canvas)
 
             # Add text only on white image
-            white_canvas = draw_text(white_canvas, lines)
+            white_canvas = draw_text(
+                white_canvas,
+                lines,
+                bg_color_hex or canvas_color or "#FFFFFF",
+            )
 
             # ---------------------------
             # Save Transparent PNG

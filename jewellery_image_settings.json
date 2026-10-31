@@ -16,6 +16,8 @@
     "method": "ai_background_removal",
     "backend": "local",
     "fallback_to_local": true,
+    "prompt": "jewelry",
+    "remove_inner_holes": true,
     "output_background": "transparent",
     "fallback_background": "#FFFFFF",
     "preserve_product_edges": true,
