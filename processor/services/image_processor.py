@@ -10,9 +10,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
-from transparent_background import Remover
 import os
 from huggingface_hub import InferenceClient
+from rembg import new_session, remove as rembg_remove
  
 ssl._create_default_https_context = ssl._create_unverified_context
 print("ssl done")
@@ -49,8 +49,9 @@ PRESET_FILES = {
     "jewellery_image": "jewellery_image_settings.json",
 }
 
-# Initialize remover once
-remover = Remover(mode="base")
+# Use the requested Bria RMBG 2.0 model.
+# Keeping one session avoids reloading the model for every uploaded image.
+rembg_session = new_session("bria-rmbg")
 
 
 # ======================================================
@@ -340,6 +341,37 @@ def preserve_original_product_pixels(
             alpha_u8[facet_mask],
             np.minimum(expanded_alpha[facet_mask], facet_min_alpha),
         )
+
+    # Remove white matte contamination from the visible edge.  The source
+    # RGB is normally retained to protect jewellery colour, but semi-
+    # transparent edge pixels can still contain the original white backdrop.
+    # Correct only neutral, bright fringe pixels; diamond sparkle and coloured
+    # stones are left untouched.
+    if product_protection.get("remove_white_edge", True):
+        edge_alpha = (alpha_u8 > 0) & (alpha_u8 < 245)
+        edge_rgb = output_rgb.astype(np.float32)
+        max_channel = np.max(edge_rgb, axis=2)
+        min_channel = np.min(edge_rgb, axis=2)
+        neutral = (max_channel - min_channel) <= float(
+            product_protection.get("white_edge_neutral_tolerance", 18)
+        )
+        bright = max_channel >= float(
+            product_protection.get("white_edge_brightness", 185)
+        )
+        fringe = edge_alpha & neutral & bright
+
+        if np.any(fringe):
+            border_size = max(5, min(src.shape[:2]) // 100)
+            border_pixels = np.concatenate([
+                src[:border_size, :, :].reshape(-1, 3),
+                src[-border_size:, :, :].reshape(-1, 3),
+                src[:, :border_size, :].reshape(-1, 3),
+                src[:, -border_size:, :].reshape(-1, 3),
+            ])
+            background_rgb = np.median(border_pixels, axis=0)
+            a = np.maximum(alpha_u8[fringe, None] / 255.0, 0.08)
+            corrected = (src[fringe] - (1.0 - a) * background_rgb) / a
+            output_rgb[fringe] = np.clip(corrected, 0, 255)
 
     # Preserve the model's alpha mask; do not hard-threshold it.
     output = np.dstack([
@@ -664,95 +696,10 @@ def remove_background(
     product_protection: dict | None = None,
 ):
     source = image.convert("RGB")
-    bg_settings = bg_settings or {}
-    product_protection = product_protection or {}
-
-    if not bg_settings.get("enabled", True):
-        return source.convert("RGBA")
-
-    selected_backend = str(
-        bg_settings.get("backend") or BACKGROUND_REMOVAL_BACKEND
-    ).strip().lower()
-
-    prompt = str(bg_settings.get("prompt") or "").strip()
-
-    if prompt:
-        try:
-            from .prompt_segmenter import segment_by_prompt
-
-            processed = segment_by_prompt(
-                source,
-                prompt,
-                box_threshold=float(bg_settings.get("prompt_box_threshold", 0.3)),
-                text_threshold=float(bg_settings.get("prompt_text_threshold", 0.25)),
-                max_objects=int(bg_settings.get("prompt_max_objects", 5)),
-            )
-        except Exception as exc:
-            if not bg_settings.get("fallback_to_local", True):
-                raise
-            print(f"Prompt segmentation failed ({exc}); using local remover.")
-            output = remover.process(source, type="rgba")
-            processed = (
-                output.convert("RGBA")
-                if isinstance(output, Image.Image)
-                else Image.fromarray(np.asarray(output)).convert("RGBA")
-            )
-    elif selected_backend == "huggingface":
-        try:
-            processed = remove_background_huggingface(source)
-        except Exception:
-            if not bg_settings.get("fallback_to_local", True):
-                raise
-
-            output = remover.process(source, type="rgba")
-
-            if isinstance(output, Image.Image):
-                processed = output.convert("RGBA")
-            elif isinstance(output, (bytes, bytearray)):
-                processed = Image.open(
-                    BytesIO(output)
-                ).convert("RGBA")
-            else:
-                processed = Image.fromarray(
-                    np.asarray(output)
-                ).convert("RGBA")
-    else:
-        output = remover.process(source, type="rgba")
-
-        if isinstance(output, Image.Image):
-            processed = output.convert("RGBA")
-        elif isinstance(output, (bytes, bytearray)):
-            processed = Image.open(
-                BytesIO(output)
-            ).convert("RGBA")
-        else:
-            processed = Image.fromarray(
-                np.asarray(output)
-            ).convert("RGBA")
-
-    if processed.size != source.size:
-        processed = processed.resize(
-            source.size,
-            Image.Resampling.LANCZOS,
-        )
-
-    if product_protection.get("preserve_original_color", True):
-        processed = preserve_original_product_pixels(
-            source,
-            processed,
-            product_protection=product_protection,
-        )
-
-    if bg_settings.get("remove_inner_holes", True):
-        from .hole_cleanup import remove_enclosed_background
-
-        processed = remove_enclosed_background(
-            source,
-            processed,
-            settings=bg_settings,
-        )
-
-    return processed
+    output = rembg_remove(source, session=rembg_session)
+    if isinstance(output, Image.Image):
+        return output.convert("RGBA")
+    return Image.open(BytesIO(output)).convert("RGBA")
 
 
 # ======================================================

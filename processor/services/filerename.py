@@ -4,7 +4,7 @@ from pathlib import Path
 import uuid
 
 # Enter your folder path here
-FOLDER_PATH = r"D:\Development\Image LabelerBgremove\Test"
+FOLDER_PATH = r"D:\Development\Image LabelerBgremove\test1"
 
 # Supported image formats
 IMAGE_EXTENSIONS = {

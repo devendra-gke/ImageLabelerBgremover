@@ -27,7 +27,15 @@
     "preserve_small_components": true,
     "remove_background_shadows": true,
     "preserve_natural_product_shadows": false,
-    "remove_reflections": false
+    "remove_reflections": false,
+    "hole_core_tolerance": 20.0,
+    "hole_grow_tolerance": 42.0,
+    "hole_flat_gradient": 22.0,
+    "hole_fringe_iterations": 1,
+    "contour_hole_min_area_px": 16,
+    "contour_hole_alpha_threshold": 8,
+    "border_background_tolerance": 32.0,
+    "border_background_gradient": 18.0
   },
   "product_protection": {
     "preserve_original_shape": true,
@@ -42,7 +50,7 @@
     "no_detail_smoothing": true,
     "preserve_facet_boundaries": true,
     "no_artificial_sparkle": true,
-    "alpha_floor": 24,
+    "alpha_floor": 0,
     "edge_recovery": false,
     "highlight_alpha_recovery": true,
     "highlight_threshold": 212,
@@ -53,7 +61,10 @@
     "max_edge_cleanup": 0.08,
     "facet_edge_threshold": 18,
     "facet_brightness_threshold": 138,
-    "facet_min_alpha": 202
+    "facet_min_alpha": 202,
+    "remove_white_edge": true,
+    "white_edge_neutral_tolerance": 18,
+    "white_edge_brightness": 185
 
   },
   "image_processing": {

@@ -2,12 +2,11 @@ from .services.image_processor import process_images
 from django.http import JsonResponse
 from django.views import View
 import traceback
-from transparent_background import Remover
 from PIL import Image
 import numpy as np
+from rembg import new_session, remove as rembg_remove
 
-# Initialize once (recommended for Django)
-remover = Remover()
+rembg_session = new_session("bria-rmbg")
 
 def remove_background(image):
     """
@@ -17,11 +16,11 @@ def remove_background(image):
     """
 
     if isinstance(image, Image.Image):
-        output = remover.process(image)
+        output = rembg_remove(image.convert("RGB"), session=rembg_session)
 
     elif isinstance(image, np.ndarray):
         image_pil = Image.fromarray(image)
-        output = remover.process(image_pil)
+        output = rembg_remove(image_pil.convert("RGB"), session=rembg_session)
 
     else:
         raise TypeError("Unsupported image type")
