@@ -740,6 +740,7 @@ def resize_to_canvas(image, bg_color_hex=None, target_width=None, target_height=
 # ======================================================
 
 def draw_text(img, lines, bg_color_hex=None):
+    lines = lines or []
     draw = ImageDraw.Draw(img)
 
     # White text on a light canvas is invisible, so pick black or white
@@ -772,12 +773,14 @@ def draw_text(img, lines, bg_color_hex=None):
 def process_images(request):
     excel_file = request.FILES.get("excel_file")
     images = request.FILES.getlist("images")
+    processing_mode = request.POST.get("processing_mode", "catalog").strip().lower()
+    transparent_only = processing_mode == "transparent_only"
 
     itemwise_base = request.POST.get("itemwise_folder")
     style_base = request.POST.get("stylebio_folder")
     bg_color_hex = request.POST.get("bg_color") or "#FFFFFF"
 
-    if not excel_file:
+    if not transparent_only and not excel_file:
         raise Exception("Excel file is required")
 
     if not images:
@@ -796,7 +799,10 @@ def process_images(request):
         os.path.join("media", "Transparent"),
     )
 
-    mapping, category_map, style_map = read_excel_mapping(excel_file)
+    if transparent_only:
+        mapping, category_map, style_map = {}, {}, {}
+    else:
+        mapping, category_map, style_map = read_excel_mapping(excel_file)
     results = []
 
     for img_file in images:
@@ -821,12 +827,10 @@ def process_images(request):
             product_protection = preset.get("product_protection", {})
             output_settings = preset.get("output", {})
 
-            bg_prompt = (request.POST.get("bg_prompt") or "").strip()
-            if bg_prompt:
-                bg_settings = {**bg_settings, "prompt": bg_prompt}
-
             key = base_token(name)
-            lines = mapping.get(key)
+            # Transparent-only mode has no Excel mapping, so there is no
+            # catalogue text to draw on the preview canvas.
+            lines = mapping.get(key) or []
 
             per_image_overrides = preset.get("per_image_overrides", {})
             item_override = {}
@@ -846,7 +850,7 @@ def process_images(request):
                             **output_override,
                         }
 
-            if not lines:
+            if not transparent_only and not lines:
                 results.append({
                     "file": filename,
                     "status": "skipped",
@@ -906,12 +910,13 @@ def process_images(request):
 
             preview = image_to_base64(white_canvas)
 
-            # Add text only on white image
-            white_canvas = draw_text(
-                white_canvas,
-                lines,
-                bg_color_hex or canvas_color or "#FFFFFF",
-            )
+            # Add catalogue text only when Excel metadata exists.
+            if lines:
+                white_canvas = draw_text(
+                    white_canvas,
+                    lines,
+                    bg_color_hex or canvas_color or "#FFFFFF",
+                )
 
             # ---------------------------
             # Save Transparent PNG
@@ -924,6 +929,18 @@ def process_images(request):
                 compress_level=1,
                 dpi=(300, 300)
             )
+
+            if transparent_only:
+                results.append({
+                    "file": filename,
+                    "status": "success",
+                    "preview": image_to_base64(transparent_canvas),
+                    "transparent_path": str(transparent_path),
+                    "category": "",
+                    "style": "",
+                    "preset": preset_name,
+                })
+                continue
 
             # ---------------------------
             # Save White Image

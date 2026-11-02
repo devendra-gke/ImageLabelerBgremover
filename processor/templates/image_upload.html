@@ -358,6 +358,36 @@
         }
         .path-picker button:hover { background: rgba(59,95,224,0.16); }
         .path-picker button:disabled { opacity: 0.6; cursor: wait; }
+        .mode-option {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: rgba(23,45,97,0.025);
+            cursor: pointer;
+        }
+        .mode-option:has(input:checked) {
+            border-color: var(--blue);
+            background: rgba(59,95,224,0.08);
+        }
+        .mode-option strong, .mode-option small { display: block; }
+        .mode-option strong { font-size: 12px; color: var(--ink); }
+        .mode-option small { margin-top: 4px; font-size: 10px; color: var(--muted); }
+        .folder-button {
+            position: relative;
+            z-index: 2;
+            margin-top: 12px;
+            padding: 8px 12px;
+            border: 1px solid var(--border-hi);
+            border-radius: 7px;
+            background: rgba(59,95,224,0.08);
+            color: var(--blue-hi);
+            font: 600 10px 'Space Mono', monospace;
+            cursor: pointer;
+        }
+        .folder-button:hover { background: rgba(59,95,224,0.16); }
 
         /* ── COLOR PICKER ── */
         .color-row { display: flex; align-items: center; gap: 14px; }
@@ -625,6 +655,20 @@
         </div>
 
         <div class="card">
+            <div class="field">
+                <div class="field-label">PROCESSING MODE</div>
+                <div class="grid-2">
+                    <label class="mode-option">
+                        <input type="radio" name="processing_mode" value="catalog" checked>
+                        <span><strong>Catalog export</strong><small>Excel matching, itemwise and StyleBio outputs</small></span>
+                    </label>
+                    <label class="mode-option">
+                        <input type="radio" name="processing_mode" value="transparent_only">
+                        <span><strong>Transparent only</strong><small>Remove background and save PNG files only</small></span>
+                    </label>
+                </div>
+            </div>
+
             <div class="grid-2">
                 <div class="field">
                     <div class="field-label">EXCEL FILE</div>
@@ -643,14 +687,13 @@
                         <input
                             type="file"
                             id="imageInput"
-                            name="images"
                             multiple
-                            webkitdirectory
-                            directory
                             accept="image/*">
+                        <input type="file" id="folderInput" multiple webkitdirectory directory accept="image/*" hidden>
                         <span class="file-drop-icon">🖼</span>
-                        <div class="file-drop-title">Drop Images / Folder</div>
-                        <div class="file-drop-hint">or <strong>click to browse</strong> — all formats</div>
+                        <div class="file-drop-title">Drop Images or Folder</div>
+                        <div class="file-drop-hint">Choose one/multiple images, or use the folder button</div>
+                        <button type="button" id="chooseFolderButton" class="folder-button">Choose folder</button>
                         <div class="file-name" id="imageName">No files selected</div>
                     </div>
                 </div>
@@ -677,15 +720,6 @@
                             <div class="color-hex" id="colorHex">#FFFFFF</div>
                             <div class="color-label">Hex value</div>
                         </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="grid-2" style="margin-bottom:22px">
-                <div class="field">
-                    <div class="field-label">KEEP OBJECT PROMPT</div>
-                    <div class="path-picker">
-                        <input type="text" id="bgPrompt" name="bg_prompt" placeholder="blank = standard prompt (jewelry); e.g. necklace, earrings">
                     </div>
                 </div>
             </div>
@@ -755,6 +789,8 @@
 </div>
 
 <script>
+const selectedImages = new Map();
+
 // ── CSRF ──
 function getCSRFToken() {
     const el = document.querySelector('[name=csrfmiddlewaretoken]');
@@ -794,8 +830,18 @@ document.getElementById("excelInput").addEventListener("change", function () {
     document.getElementById("excelName").textContent = name;
 });
 
-document.getElementById("imageInput").addEventListener("change", function () {
-    const count = this.files.length;
+function addSelectedImages(fileList) {
+    Array.from(fileList).forEach(file => {
+        if (file.type.startsWith("image/")) {
+            selectedImages.set(`${file.name}|${file.size}|${file.lastModified}`, file);
+        }
+    });
+    renderSelectedImages();
+}
+
+function renderSelectedImages() {
+    const files = Array.from(selectedImages.values());
+    const count = files.length;
     document.getElementById("imageName").textContent =
         count === 0 ? "No files selected" : `${count} file${count > 1 ? 's' : ''} selected`;
     document.getElementById("origCount").textContent = `${count} file${count !== 1 ? 's' : ''}`;
@@ -803,7 +849,7 @@ document.getElementById("imageInput").addEventListener("change", function () {
     const container = document.getElementById("originalPreview");
     container.innerHTML = "";
 
-    Array.from(this.files).forEach((file, i) => {
+    files.forEach((file, i) => {
         const item = document.createElement("div");
         item.className = "preview-item";
         item.style.animationDelay = `${i * 0.04}s`;
@@ -819,6 +865,31 @@ document.getElementById("imageInput").addEventListener("change", function () {
         item.appendChild(img);
         item.appendChild(lbl);
         container.appendChild(item);
+    });
+}
+
+document.getElementById("imageInput").addEventListener("change", function () {
+    addSelectedImages(this.files);
+    this.value = "";
+});
+
+document.getElementById("folderInput").addEventListener("change", function () {
+    addSelectedImages(this.files);
+    this.value = "";
+});
+
+document.getElementById("chooseFolderButton").addEventListener("click", function (event) {
+    event.stopPropagation();
+    document.getElementById("folderInput").click();
+});
+
+document.querySelectorAll('input[name="processing_mode"]').forEach(input => {
+    input.addEventListener("change", function () {
+        const catalog = this.value === "catalog" && this.checked;
+        document.getElementById("excelInput").required = catalog;
+        document.getElementById("excelDrop").style.opacity = catalog ? "1" : "0.45";
+        document.getElementById("itemwiseFolder").closest(".field").style.opacity = catalog ? "1" : "0.45";
+        document.getElementById("stylebioFolder").closest(".field").style.opacity = catalog ? "1" : "0.45";
     });
 });
 
@@ -842,6 +913,12 @@ document.getElementById("uploadForm").addEventListener("submit", async function 
     e.preventDefault();
 
     const formData = new FormData(this);
+    formData.delete("images");
+    Array.from(selectedImages.values()).forEach(file => formData.append("images", file, file.name));
+    if (selectedImages.size === 0) {
+        alert("Please choose one or more images, or select a folder.");
+        return;
+    }
     const loader = document.getElementById("loader");
     loader.style.display = "flex";
 
