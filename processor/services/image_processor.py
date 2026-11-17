@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import ssl
 from io import BytesIO
 from pathlib import Path
@@ -10,8 +11,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from scipy.ndimage import distance_transform_edt
 import os
 from huggingface_hub import InferenceClient
+from pymatting import estimate_foreground_ml
 from rembg import new_session, remove as rembg_remove
  
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -59,12 +62,7 @@ rembg_session = new_session("bria-rmbg")
 # ======================================================
 
 
-import numpy as np
-from PIL import Image, ImageFilter
 from io import BytesIO
-
-
-
 def remove_background_huggingface(image: Image.Image) -> Image.Image:
     """
     Use a Hugging Face image-segmentation model to generate
@@ -156,6 +154,7 @@ def preserve_original_product_pixels(
     original: Image.Image,
     processed: Image.Image,
     product_protection: dict | None = None,
+    estimated_rgb: np.ndarray | None = None,
 ) -> Image.Image:
     """
     Preserve original jewellery colours and shine.
@@ -179,8 +178,27 @@ def preserve_original_product_pixels(
     initial_alpha_u8 = alpha_u8.copy()
     alpha = alpha_u8 / 255.0
 
-    # Start with the original image colour so stone tones stay intact.
-    output_rgb = src.copy()
+    # Use the PyMatting estimate when supplied. This keeps decontaminated
+    # edge colour while the recovery logic below protects fine product detail.
+    # For reflective products, PyMatting can soften bright facets and glow.
+    # Keep the camera pixels unless a preset explicitly opts into estimated
+    # foreground RGB. The alpha mask is still used for the cutout.
+    # Diamond colour must come from the original camera pixels. Estimated
+    # foreground RGB is useful for contaminated matte edges, but it can
+    # change the stone's size/shape appearance and wash out its facets.
+    preserve_source_rgb = bool(
+        product_protection.get("preserve_source_rgb", True)
+    )
+    use_estimated_rgb = bool(
+        product_protection.get("use_estimated_foreground_rgb", False)
+    ) and not preserve_source_rgb
+    output_rgb = (
+        np.asarray(estimated_rgb, dtype=np.float32).copy()
+        if use_estimated_rgb and estimated_rgb is not None
+        else src.copy()
+    )
+    if output_rgb.shape != src.shape:
+        output_rgb = src.copy()
 
     edge_recovery = bool(product_protection.get("edge_recovery", False))
 
@@ -240,6 +258,8 @@ def preserve_original_product_pixels(
         alpha_u8[nonzero] = np.maximum(alpha_u8[nonzero], alpha_floor)
 
     alpha_expand_px = int(product_protection.get("alpha_expand_px", 1))
+    if product_protection.get("preserve_diamond_shape", False):
+        alpha_expand_px = 0
     alpha_expand_px = min(max(alpha_expand_px, 0), 4)
 
     if alpha_expand_px > 0:
@@ -269,13 +289,40 @@ def preserve_original_product_pixels(
             )
             sparkle_min_alpha = min(max(sparkle_min_alpha, 0), 255)
 
-            # Bright pixels near uncertain edges are likely real sparkle,
-            # so raise alpha there using a localized expanded mask.
+            # Protect only bright pixels close to the nearest existing
+            # product border. This preserves diamond shine while preventing
+            # white studio background from being pulled into the cutout.
             sparkle = np.max(src, axis=2) >= highlight_threshold
             uncertain = alpha_u8 < 245
-            keep_mask = sparkle & uncertain & (expanded_alpha > 0)
+            alpha_seed = int(
+                product_protection.get("highlight_alpha_seed", 8)
+            )
+            alpha_seed = min(max(alpha_seed, 1), 255)
+            foreground_seed = initial_alpha_u8 >= alpha_seed
+            nearest_border_distance = distance_transform_edt(
+                ~foreground_seed
+            )
+            max_highlight_distance = max(
+                float(
+                    product_protection.get(
+                        "max_highlight_distance_px", 6
+                    )
+                ),
+                0.0,
+            )
+            near_product_border = (
+                nearest_border_distance <= max_highlight_distance
+            )
+            keep_mask = (
+                sparkle
+                & uncertain
+                & near_product_border
+                & (expanded_alpha > 0)
+            )
 
-            boosted = np.minimum(expanded_alpha, sparkle_min_alpha)
+            # Only the actual highlight pixel is raised. The source RGB is
+            # retained below, so its original diamond colour remains sharp.
+            boosted = np.full_like(alpha_u8, sparkle_min_alpha)
 
             alpha_u8[keep_mask] = np.maximum(
                 alpha_u8[keep_mask],
@@ -293,13 +340,72 @@ def preserve_original_product_pixels(
                     sparkle
                     & (initial_alpha_u8 == 0)
                     & (expanded_alpha >= zero_seed_alpha)
+                    & near_product_border
                 )
                 alpha_u8[recover_zero] = np.maximum(
                     alpha_u8[recover_zero],
                     boosted[recover_zero],
                 )
 
-    if product_protection.get("preserve_facet_boundaries", True):
+    # Keep the product body fully opaque. Segmentation mattes often leave
+    # the diamond interior slightly translucent (e.g. alpha 180-240), which
+    # makes white shine blend into the canvas and look dull. Pixels already
+    # confidently inside the product are raised to solid; the soft edge
+    # transition below the threshold is left untouched.
+    solid_core_threshold = int(
+        product_protection.get("solid_core_threshold", 0) or 0
+    )
+    if solid_core_threshold > 0:
+        solid_core_threshold = min(max(solid_core_threshold, 1), 254)
+        solid_core_alpha = int(
+            product_protection.get("solid_core_alpha", 255) or 255
+        )
+        solid_core_alpha = min(max(solid_core_alpha, 0), 255)
+        core = alpha_u8 >= solid_core_threshold
+        alpha_u8[core] = np.maximum(alpha_u8[core], solid_core_alpha)
+
+    # Remove leftover background haze. Segmentation often leaves a soft,
+    # low-alpha white blur around the product (the defocused studio
+    # backdrop). Any faint pixel that is NOT close to the solid product
+    # body is background residue and is cut to zero. Bright sparkle pixels
+    # near the body are protected so real diamond shine is never removed.
+    haze_cutoff = int(
+        product_protection.get("haze_cutoff_alpha", 0) or 0
+    )
+    if haze_cutoff > 0:
+        haze_cutoff = min(max(haze_cutoff, 1), 254)
+        body_seed = int(
+            product_protection.get("haze_body_seed", 200) or 200
+        )
+        body_seed = min(max(body_seed, 1), 255)
+        max_haze_distance = max(
+            float(product_protection.get("haze_max_distance_px", 3) or 3),
+            0.0,
+        )
+        haze_highlight_threshold = int(
+            product_protection.get(
+                "haze_highlight_threshold",
+                product_protection.get("highlight_threshold", 195),
+            )
+        )
+
+        distance_to_body = distance_transform_edt(
+            initial_alpha_u8 < body_seed
+        )
+        near_body = distance_to_body <= max_haze_distance
+        bright_sparkle = np.max(src, axis=2) >= haze_highlight_threshold
+
+        haze = (
+            (alpha_u8 > 0)
+            & (alpha_u8 < haze_cutoff)
+            & (~(near_body & bright_sparkle))
+        )
+        alpha_u8[haze] = 0
+
+    if (
+        product_protection.get("preserve_facet_boundaries", True)
+        and not product_protection.get("preserve_diamond_shape", False)
+    ):
         # Preserve thin prongs and facet edges that segmentation can fade.
         gray = (
             (0.299 * src[..., 0])
@@ -347,7 +453,7 @@ def preserve_original_product_pixels(
     # transparent edge pixels can still contain the original white backdrop.
     # Correct only neutral, bright fringe pixels; diamond sparkle and coloured
     # stones are left untouched.
-    if product_protection.get("remove_white_edge", True):
+    if product_protection.get("remove_white_edge", False):
         edge_alpha = (alpha_u8 > 0) & (alpha_u8 < 245)
         edge_rgb = output_rgb.astype(np.float32)
         max_channel = np.max(edge_rgb, axis=2)
@@ -548,7 +654,11 @@ def base_token(s: str) -> str:
     s = (s or "").strip()
     if "_" in s:
         s = s.split("_", 1)[0]
-    return s.lower()
+    # Image names commonly contain variants such as "K-05684 P (3)".
+    # Match the product tag only so per-image protection settings apply to
+    # every view/copy of the same item.
+    match = re.match(r"^([a-z]+-\d+|\d+)", s, flags=re.IGNORECASE)
+    return (match.group(1) if match else s).lower()
 
 
 def get_series(df, col_letter):
@@ -690,16 +800,145 @@ def read_excel_mapping(excel_file):
 # BACKGROUND REMOVAL
 # ======================================================
 
+def estimate_foreground_color(
+    source: Image.Image,
+    alpha_image: Image.Image,
+    settings: dict | None = None,
+) -> np.ndarray:
+    """Estimate decontaminated foreground RGB while keeping RGBA detail.
+
+    PyMatting is run on a bounded-size copy to avoid making large uploads
+    disproportionately slow. The returned RGB image is resized back to the
+    source dimensions; the original rembg alpha is never changed. Opaque
+    source pixels and bright diamond highlights are always copied back from
+    the camera image so PyMatting cannot wash out the shine.
+    """
+    settings = settings or {}
+    source_rgba = source.convert("RGBA")
+    source = source_rgba.convert("RGB")
+    alpha_image = alpha_image.convert("L")
+    original_size = source.size
+
+    max_size = int(settings.get("max_size", 1024) or 0)
+    if max_size > 0 and max(original_size) > max_size:
+        scale = max_size / max(original_size)
+        estimate_size = (
+            max(1, round(original_size[0] * scale)),
+            max(1, round(original_size[1] * scale)),
+        )
+        source_for_estimate = source.resize(
+            estimate_size,
+            Image.Resampling.LANCZOS,
+        )
+        alpha_for_estimate = alpha_image.resize(
+            estimate_size,
+            Image.Resampling.LANCZOS,
+        )
+    else:
+        source_for_estimate = source
+        alpha_for_estimate = alpha_image
+
+    image_array = np.asarray(source_for_estimate, dtype=np.float32) / 255.0
+    alpha_array = np.asarray(alpha_for_estimate, dtype=np.float32) / 255.0
+
+    foreground = estimate_foreground_ml(
+        image_array,
+        alpha_array,
+        regularization=float(settings.get("regularization", 1e-5)),
+        n_small_iterations=int(settings.get("small_iterations", 10)),
+        n_big_iterations=int(settings.get("big_iterations", 2)),
+        small_size=int(settings.get("small_size", 32)),
+    )
+    foreground = np.clip(foreground, 0.0, 1.0)
+    foreground_image = Image.fromarray(
+        np.round(foreground * 255.0).astype(np.uint8),
+        mode="RGB",
+    )
+
+    if foreground_image.size != original_size:
+        foreground_image = foreground_image.resize(
+            original_size,
+            Image.Resampling.BILINEAR,
+        )
+
+    foreground_rgb = np.asarray(foreground_image, dtype=np.float32)
+    source_rgb = np.asarray(source, dtype=np.float32)
+    source_alpha = np.asarray(source_rgba.getchannel("A"), dtype=np.float32) / 255.0
+    model_alpha = np.asarray(alpha_image, dtype=np.float32) / 255.0
+    alpha = model_alpha * source_alpha
+
+    # Opaque pixels already contain reliable product colour. PyMatting is
+    # needed mainly for the semi-transparent pixels contaminated by backdrop.
+    reliable = alpha >= float(settings.get("opaque_threshold", 0.995))
+
+    # Diamond shine is usually a near-white, high-frequency highlight. Keep
+    # those original RGB values even when their matte is soft or translucent.
+    highlight_threshold = float(
+        settings.get("highlight_threshold", 220)
+    )
+    highlight = np.max(source_rgb, axis=2) >= highlight_threshold
+    preserve_source = reliable | highlight
+    foreground_rgb[preserve_source] = source_rgb[preserve_source]
+
+    return np.clip(foreground_rgb, 0.0, 255.0).astype(np.uint8)
+
 def remove_background(
     image: Image.Image,
     bg_settings: dict | None = None,
     product_protection: dict | None = None,
 ):
-    source = image.convert("RGB")
+    source_rgba = image.convert("RGBA")
+    source = source_rgba.convert("RGB")
     output = rembg_remove(source, session=rembg_session)
     if isinstance(output, Image.Image):
-        return output.convert("RGBA")
-    return Image.open(BytesIO(output)).convert("RGBA")
+        result = output.convert("RGBA")
+    else:
+        result = Image.open(BytesIO(output)).convert("RGBA")
+
+    # Respect an alpha channel that came with the input instead of replacing
+    # it with a new matte. This keeps RGBA transparent-folder detail intact.
+    model_alpha = np.asarray(result.getchannel("A"), dtype=np.uint16)
+    input_alpha = np.asarray(source_rgba.getchannel("A"), dtype=np.uint16)
+    alpha = Image.fromarray(
+        ((model_alpha * input_alpha + 127) // 255).astype(np.uint8),
+        mode="L",
+    )
+    settings = (bg_settings or {}).get("foreground_estimation", {})
+    if settings.get("enabled", True):
+        try:
+            foreground_rgb = estimate_foreground_color(
+                source_rgba,
+                alpha,
+                settings,
+            )
+        except Exception:
+            # Keep background removal resilient if PyMatting cannot process a
+            # particular image; the source RGB remains the safest fallback.
+            foreground_rgb = np.asarray(source, dtype=np.uint8)
+    else:
+        # Do not run PyMatting for reflective diamonds. It is useful for
+        # contaminated matte edges, but it can blur small facets and glow.
+        foreground_rgb = np.asarray(source, dtype=np.uint8)
+
+    result = Image.fromarray(
+        np.dstack([foreground_rgb, np.asarray(alpha, dtype=np.uint8)]),
+        mode="RGBA",
+    )
+
+    protection = product_protection or {}
+    if any(protection.get(key, False) for key in (
+        "preserve_diamond_color",
+        "preserve_setting_details",
+        "no_detail_smoothing",
+    )):
+        result = preserve_original_product_pixels(
+            source,
+            result,
+            protection,
+            estimated_rgb=foreground_rgb,
+        )
+
+    return result
 
 
 # ======================================================
@@ -861,7 +1100,11 @@ def process_images(request):
             # ---------------------------# ---------------------------
             # Load Image
             # ---------------------------
-            im = Image.open(img_file).convert("RGB")
+            with Image.open(img_file) as opened_image:
+                source_rgba = opened_image.convert("RGBA")
+            im = source_rgba.convert("RGB")
+            existing_alpha = source_rgba.getchannel("A")
+            has_existing_transparency = existing_alpha.getextrema()[0] < 255
 
             # ---------------------------
             # Remove background and preserve product colour
@@ -872,7 +1115,12 @@ def process_images(request):
                 else None
             )
 
-            if reference_matte:
+            # Transparent-folder PNGs already contain the product matte. Do
+            # not send them through RMBG again: a second segmentation pass
+            # commonly removes the hollow diamond facets and white shine.
+            if transparent_only and has_existing_transparency:
+                transparent_im = source_rgba
+            elif reference_matte:
                 transparent_im = apply_reference_matte(
                     im,
                     reference_matte,

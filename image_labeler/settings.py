@@ -154,3 +154,11 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 MEDIA_URL = '/media/'
+
+# The transparent-folder workflow can submit more than Django's default
+# 1,000 multipart files in one request. This is a local image-processing app,
+# so allow bulk folder uploads without Django rejecting the request during
+# multipart parsing. Uploaded files are streamed to Django's temporary-file
+# handler rather than kept entirely in memory.
+DATA_UPLOAD_MAX_NUMBER_FILES = None
+DATA_UPLOAD_MAX_MEMORY_SIZE = None

@@ -28,6 +28,10 @@
     "remove_background_shadows": true,
     "preserve_natural_product_shadows": false,
     "remove_reflections": false,
+    "foreground_estimation": {
+      "enabled": true,
+      "highlight_threshold": 220
+    },
     "hole_core_tolerance": 20.0,
     "hole_grow_tolerance": 42.0,
     "hole_flat_gradient": 22.0,
@@ -42,6 +46,8 @@
     "preserve_original_color": true,
     "preserve_gold_tone": true,
     "preserve_diamond_color": true,
+    "preserve_source_rgb": true,
+    "preserve_diamond_shape": true,
     "preserve_gemstone_color": true,
     "preserve_stone_count": true,
     "preserve_setting_details": true,
@@ -54,7 +60,9 @@
     "edge_recovery": false,
     "highlight_alpha_recovery": true,
     "highlight_threshold": 212,
-    "alpha_expand_px": 3,
+    "alpha_expand_px": 0,
+    "highlight_alpha_seed": 8,
+    "max_highlight_distance_px": 8,
     "sparkle_min_alpha": 214,
     "recover_zero_alpha_sparkle": true,
     "zero_alpha_seed": 24,
@@ -62,7 +70,8 @@
     "facet_edge_threshold": 18,
     "facet_brightness_threshold": 138,
     "facet_min_alpha": 202,
-    "remove_white_edge": true,
+    "remove_white_edge": false,
+    "use_estimated_foreground_rgb": true,
     "white_edge_neutral_tolerance": 18,
     "white_edge_brightness": 185
 
@@ -98,6 +107,19 @@
     "require_product_visible": true
   },
   "per_image_overrides": {
+    "k-05684": {
+      "product_protection": {
+        "alpha_expand_px": 0,
+        "highlight_alpha_seed": 4,
+        "max_highlight_distance_px": 10,
+        "recover_zero_alpha_sparkle": true,
+        "zero_alpha_seed": 1,
+        "highlight_threshold": 180,
+        "sparkle_min_alpha": 255,
+        "facet_min_alpha": 220,
+        "remove_white_edge": false
+      }
+    },
     "71249": {
       "reference_matte": "media/Transparent/71249-P.png",
       "output": {
