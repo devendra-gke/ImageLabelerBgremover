@@ -15,6 +15,7 @@
     "enabled": true,
     "method": "ai_background_removal",
     "backend": "local",
+    "model": "bria-rmbg",
     "fallback_to_local": true,
     "prompt": "jewelry",
     "remove_inner_holes": true,
@@ -39,7 +40,17 @@
     "contour_hole_min_area_px": 16,
     "contour_hole_alpha_threshold": 8,
     "border_background_tolerance": 32.0,
-    "border_background_gradient": 18.0
+    "border_background_gradient": 18.0,
+    "detection": {
+      "model": "u2netp",
+      "enabled": true,
+      "detector": "saliency",
+      "prompt": "jewelry",
+      "refine": true,
+      "refine_margin": 0.12
+    },
+    "recover_thin_details": true,
+    "remove_specks": true
   },
   "product_protection": {
     "preserve_original_shape": true,
@@ -74,7 +85,6 @@
     "use_estimated_foreground_rgb": true,
     "white_edge_neutral_tolerance": 18,
     "white_edge_brightness": 185
-
   },
   "image_processing": {
     "auto_crop": true,
@@ -87,7 +97,8 @@
     "denoise": false,
     "brightness_adjustment": false,
     "contrast_adjustment": false,
-    "saturation_adjustment": false
+    "saturation_adjustment": false,
+    "max_upscale": 2.0
   },
   "output": {
     "format": "png",
@@ -131,10 +142,30 @@
       "reference_matte": "media/Transparent/87450_rem.png",
       "use_reference_rgb": true,
       "repair_regions": [
-        [0.285, 0.465, 0.315, 0.525],
-        [0.665, 0.465, 0.695, 0.525],
-        [0.340, 0.680, 0.370, 0.735],
-        [0.465, 0.820, 0.500, 0.870]
+        [
+          0.285,
+          0.465,
+          0.315,
+          0.525
+        ],
+        [
+          0.665,
+          0.465,
+          0.695,
+          0.525
+        ],
+        [
+          0.34,
+          0.68,
+          0.37,
+          0.735
+        ],
+        [
+          0.465,
+          0.82,
+          0.5,
+          0.87
+        ]
       ]
     }
   }

@@ -15,6 +15,7 @@
     "enabled": true,
     "method": "ai_background_removal",
     "backend": "local",
+    "model": "bria-rmbg",
     "fallback_to_local": true,
     "prompt": "diamond",
     "remove_inner_holes": true,
@@ -30,7 +31,18 @@
     "foreground_estimation": {
       "enabled": false,
       "highlight_threshold": 220
-    }
+    },
+    "detection": {
+      "model": "u2netp",
+      "enabled": true,
+      "detector": "saliency",
+      "prompt": "diamond",
+      "refine": true,
+      "refine_margin": 0.12
+    },
+    "recover_thin_details": true,
+    "remove_specks": true,
+    "hole_filled_min_area_ratio": 1.0
   },
   "product_protection": {
     "preserve_original_shape": true,
@@ -80,7 +92,8 @@
     "denoise": false,
     "brightness_adjustment": false,
     "contrast_adjustment": false,
-    "saturation_adjustment": false
+    "saturation_adjustment": false,
+    "max_upscale": 2.0
   },
   "output": {
     "format": "png",

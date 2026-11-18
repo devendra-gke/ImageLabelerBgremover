@@ -1,39 +1,28 @@
-from .services.image_processor import process_images
-from django.http import JsonResponse
-from django.views import View
+import base64
 import traceback
-from PIL import Image
-import numpy as np
-from rembg import new_session, remove as rembg_remove
+from io import BytesIO
 
-rembg_session = new_session("bria-rmbg")
+from django.http import JsonResponse
+from django.shortcuts import render
+from django.views import View
+from PIL import Image, ImageOps
 
-def remove_background(image):
-    """
-    Same logic as Hugging Face Space.
-    Accepts PIL Image or NumPy array.
-    Returns a PIL Image with transparent background.
-    """
+from .services.image_processor import (
+    load_preset_settings,
+    remove_background_detailed,
+    resolve_preset_name,
+    process_images,
+)
 
-    if isinstance(image, Image.Image):
-        output = rembg_remove(image.convert("RGB"), session=rembg_session)
-
-    elif isinstance(image, np.ndarray):
-        image_pil = Image.fromarray(image)
-        output = rembg_remove(image_pil.convert("RGB"), session=rembg_session)
-
-    else:
-        raise TypeError("Unsupported image type")
-
-    return output
-
-
-
-##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
 
 def upload_page(request):
-    from django.shortcuts import render
     return render(request, "image_upload.html")
+
+
+def _png_b64(img: Image.Image, fmt: str = "PNG") -> str:
+    buffer = BytesIO()
+    img.save(buffer, format=fmt, compress_level=1) if fmt == "PNG" else img.save(buffer, format=fmt)
+    return base64.b64encode(buffer.getvalue()).decode()
 
 
 class ImageProcessAPI(View):
@@ -51,6 +40,77 @@ class ImageProcessAPI(View):
             return JsonResponse({
                 "error": str(e)
             }, status=500)
+
+
+class Make3DAPI(View):
+    """Build the textures for the 3D viewer from one jewellery photo.
+
+    POST fields:
+      image       - photo or transparent PNG
+      depth_mode  - auto | shape | ai | hybrid
+      roundness   - 0.3 .. 2.0 (shape profile, default 1)
+      remove_bg   - auto | yes | no  (auto: skip if the PNG is already transparent)
+      preset      - optional preset name (jewellery / diamond)
+    """
+
+    def post(self, request):
+        from .services.depth3d import build_relief
+
+        upload = request.FILES.get("image")
+        if not upload:
+            return JsonResponse({"error": "Please choose an image."}, status=400)
+        try:
+            with Image.open(upload) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGBA")
+
+            remove_bg = (request.POST.get("remove_bg") or "auto").lower()
+            has_alpha = image.getchannel("A").getextrema()[0] < 250
+            warnings = []
+            detection = None
+            if remove_bg == "yes" or (remove_bg == "auto" and not has_alpha):
+                preset = load_preset_settings(resolve_preset_name(request, filename=upload.name))
+                cutout, result = remove_background_detailed(
+                    image.convert("RGB"),
+                    bg_settings={**preset.get("background_removal", {}), "_validation": preset.get("validation", {})},
+                    product_protection=preset.get("product_protection", {}),
+                )
+                if not result.bbox:
+                    return JsonResponse({"error": "No jewellery detected in this photo."}, status=422)
+                warnings.extend(result.warnings)
+                detection = result.as_dict(image.width, image.height)
+                image = cutout
+
+            try:
+                roundness = float(request.POST.get("roundness") or 1.0)
+            except ValueError:
+                roundness = 1.0
+            relief = build_relief(
+                image,
+                mode=request.POST.get("depth_mode") or "auto",
+                roundness=min(max(roundness, 0.3), 2.0),
+            )
+            warnings.extend(relief["warnings"])
+            return JsonResponse({
+                "name": upload.name.rsplit(".", 1)[0],
+                "cutout": _png_b64(relief["cutout"]),
+                "depth": _png_b64(relief["depth"]),
+                "detail": _png_b64(relief["detail"]),
+                "width": relief["width"],
+                "height": relief["height"],
+                "depth_mode": relief["mode"],
+                "detection": detection,
+                "warnings": warnings,
+            })
+        except Exception as exc:
+            print(traceback.format_exc())
+            return JsonResponse({"error": str(exc)}, status=500)
+
+
+class DepthStatusAPI(View):
+    def get(self, request):
+        from .services.depth3d import ai_depth_available
+
+        return JsonResponse({"ai_depth_ready": ai_depth_available()})
 
 
 class SelectOutputFolderAPI(View):

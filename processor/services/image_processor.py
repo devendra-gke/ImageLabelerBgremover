@@ -11,14 +11,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
-from scipy.ndimage import distance_transform_edt
+import time
+
+import cv2
 import os
-from huggingface_hub import InferenceClient
 from pymatting import estimate_foreground_ml
-from rembg import new_session, remove as rembg_remove
- 
+
+from .jewellery_detection import (
+    CutoutResult,
+    cutout_jewellery,
+    crop_to_product,
+    draw_detection_overlay,
+)
+
 ssl._create_default_https_context = ssl._create_unverified_context
-print("ssl done")
 
 # ======================================================
 # CONFIGURATION
@@ -52,9 +58,9 @@ PRESET_FILES = {
     "jewellery_image": "jewellery_image_settings.json",
 }
 
-# Use the requested Bria RMBG 2.0 model.
-# Keeping one session avoids reloading the model for every uploaded image.
-rembg_session = new_session("bria-rmbg")
+# The segmentation model (default Bria RMBG 2.0, set "model" in the preset's
+# background_removal section or BG_REMOVAL_MODEL env var) is loaded lazily
+# once and shared - see services/model_sessions.py.
 
 
 # ======================================================
@@ -71,6 +77,8 @@ def remove_background_huggingface(image: Image.Image) -> Image.Image:
     HF_SEGMENTATION_MODEL must identify a compatible segmentation
     model, not an image-generation model such as Qwen-Image.
     """
+    from huggingface_hub import InferenceClient
+
     if not HF_TOKEN:
         raise RuntimeError("HF_TOKEN is not configured.")
 
@@ -148,6 +156,17 @@ def remove_background_huggingface(image: Image.Image) -> Image.Image:
     rgba.putalpha(foreground_mask)
     return rgba
 
+
+
+def _distance_to(mask: np.ndarray) -> np.ndarray:
+    """Euclidean distance of every pixel to the nearest True pixel in mask.
+
+    Same result as scipy's distance_transform_edt(~mask) but several times
+    faster (OpenCV, exact mask). Pixels are infinitely far when mask is empty.
+    """
+    if not mask.any():
+        return np.full(mask.shape, np.inf, np.float32)
+    return cv2.distanceTransform((~mask).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
 
 
 def preserve_original_product_pixels(
@@ -299,9 +318,7 @@ def preserve_original_product_pixels(
             )
             alpha_seed = min(max(alpha_seed, 1), 255)
             foreground_seed = initial_alpha_u8 >= alpha_seed
-            nearest_border_distance = distance_transform_edt(
-                ~foreground_seed
-            )
+            nearest_border_distance = _distance_to(foreground_seed)
             max_highlight_distance = max(
                 float(
                     product_protection.get(
@@ -389,9 +406,7 @@ def preserve_original_product_pixels(
             )
         )
 
-        distance_to_body = distance_transform_edt(
-            initial_alpha_u8 < body_seed
-        )
+        distance_to_body = _distance_to(initial_alpha_u8 >= body_seed)
         near_body = distance_to_body <= max_haze_distance
         bright_sparkle = np.max(src, axis=2) >= haze_highlight_threshold
 
@@ -681,6 +696,32 @@ def image_to_base64(img):
     return base64.b64encode(buffer.getvalue()).decode()
 
 
+def thumbnail(img, max_side=900, crop=False):
+    """Downscaled copy for previews (optionally cropped to the product)."""
+    if crop and img.mode == "RGBA":
+        img = crop_to_product(img)
+    img = img.copy()
+    img.thumbnail((max_side, max_side), Image.Resampling.BILINEAR, reducing_gap=2.0)
+    return img
+
+
+def image_to_base64_jpeg(img, quality=85):
+    buffer = BytesIO()
+    img.convert("RGB").save(buffer, format="JPEG", quality=quality)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def media_url_for(path) -> str | None:
+    """URL of a saved file when it lives under MEDIA_ROOT (served in DEBUG)."""
+    try:
+        from django.conf import settings
+
+        rel = Path(path).resolve().relative_to(Path(settings.MEDIA_ROOT).resolve())
+    except Exception:
+        return None
+    return settings.MEDIA_URL.rstrip("/") + "/" + rel.as_posix()
+
+
 def hex_to_rgb(hex_color):
     if not hex_color:
         return (255, 255, 255)
@@ -723,6 +764,24 @@ def get_named_series(df, *candidate_names):
             return df[normalized_map[key]]
 
     return None
+
+
+_EXCEL_CACHE: dict[str, tuple] = {}
+
+
+def read_excel_mapping_cached(excel_file):
+    """The page sends the same Excel with every image; parse it once."""
+    import hashlib
+
+    data = excel_file.read()
+    key = hashlib.sha1(data).hexdigest()
+    cached = _EXCEL_CACHE.get(key)
+    if cached is None:
+        cached = read_excel_mapping(BytesIO(data))
+        if len(_EXCEL_CACHE) >= 8:
+            _EXCEL_CACHE.pop(next(iter(_EXCEL_CACHE)))
+        _EXCEL_CACHE[key] = cached
+    return cached
 
 
 def read_excel_mapping(excel_file):
@@ -887,76 +946,124 @@ def remove_background(
     bg_settings: dict | None = None,
     product_protection: dict | None = None,
 ):
+    """Backwards-compatible wrapper returning only the RGBA cutout."""
+    return remove_background_detailed(image, bg_settings, product_protection)[0]
+
+
+def remove_background_detailed(
+    image: Image.Image,
+    bg_settings: dict | None = None,
+    product_protection: dict | None = None,
+) -> tuple[Image.Image, CutoutResult]:
+    """Detect the jewellery, cut it out and protect product colour/sparkle.
+
+    Returns (rgba_cutout, detection_result). All colour work runs only on the
+    crop around the jewellery; the rest of the photo is transparent.
+    """
     source_rgba = image.convert("RGBA")
     source = source_rgba.convert("RGB")
-    output = rembg_remove(source, session=rembg_session)
-    if isinstance(output, Image.Image):
-        result = output.convert("RGBA")
-    else:
-        result = Image.open(BytesIO(output)).convert("RGBA")
+    detection = cutout_jewellery(source, bg_settings)
+    full_w, full_h = source.size
+    output = np.zeros((full_h, full_w, 4), np.uint8)
+    if detection.alpha_roi is None:
+        return Image.fromarray(output, mode="RGBA"), detection
+
+    t0 = time.perf_counter()
+    x0, y0, x1, y1 = detection.roi
+    crop_rgba = source_rgba.crop((x0, y0, x1, y1))
+    crop_rgb = crop_rgba.convert("RGB")
 
     # Respect an alpha channel that came with the input instead of replacing
     # it with a new matte. This keeps RGBA transparent-folder detail intact.
-    model_alpha = np.asarray(result.getchannel("A"), dtype=np.uint16)
-    input_alpha = np.asarray(source_rgba.getchannel("A"), dtype=np.uint16)
+    model_alpha = detection.alpha_roi.astype(np.uint16)
+    input_alpha = np.asarray(crop_rgba.getchannel("A"), dtype=np.uint16)
     alpha = Image.fromarray(
         ((model_alpha * input_alpha + 127) // 255).astype(np.uint8),
         mode="L",
     )
+
+    protection = product_protection or {}
+    protect = any(protection.get(key, False) for key in (
+        "preserve_diamond_color",
+        "preserve_setting_details",
+        "no_detail_smoothing",
+    ))
+    # The PyMatting colour estimate is only used when the protection step is
+    # off, or when the preset explicitly asks for estimated colours. With
+    # preserve_source_rgb (the jewellery default) it would be discarded, so
+    # skip it - it is one of the slowest steps.
+    estimate_used = (not protect) or (
+        bool(protection.get("use_estimated_foreground_rgb", False))
+        and not bool(protection.get("preserve_source_rgb", True))
+    )
     settings = (bg_settings or {}).get("foreground_estimation", {})
-    if settings.get("enabled", True):
+    foreground_rgb = np.asarray(crop_rgb, dtype=np.uint8)
+    if estimate_used and settings.get("enabled", True):
         try:
-            foreground_rgb = estimate_foreground_color(
-                source_rgba,
-                alpha,
-                settings,
-            )
+            foreground_rgb = estimate_foreground_color(crop_rgba, alpha, settings)
         except Exception:
             # Keep background removal resilient if PyMatting cannot process a
             # particular image; the source RGB remains the safest fallback.
-            foreground_rgb = np.asarray(source, dtype=np.uint8)
-    else:
-        # Do not run PyMatting for reflective diamonds. It is useful for
-        # contaminated matte edges, but it can blur small facets and glow.
-        foreground_rgb = np.asarray(source, dtype=np.uint8)
+            foreground_rgb = np.asarray(crop_rgb, dtype=np.uint8)
 
     result = Image.fromarray(
         np.dstack([foreground_rgb, np.asarray(alpha, dtype=np.uint8)]),
         mode="RGBA",
     )
-
-    protection = product_protection or {}
-    if any(protection.get(key, False) for key in (
-        "preserve_diamond_color",
-        "preserve_setting_details",
-        "no_detail_smoothing",
-    )):
+    if protect:
         result = preserve_original_product_pixels(
-            source,
+            crop_rgb,
             result,
             protection,
             estimated_rgb=foreground_rgb,
         )
 
-    return result
+    output[y0:y1, x0:x1] = np.asarray(result, dtype=np.uint8)
+    detection.timings["protect_s"] = round(time.perf_counter() - t0, 2)
+    return Image.fromarray(output, mode="RGBA"), detection
 
 
 # ======================================================
 # RESIZE IMAGE TO FIXED CANVAS
 # ======================================================
 
-def resize_to_canvas(image, bg_color_hex=None, target_width=None, target_height=None):
+def resize_to_canvas(
+    image,
+    bg_color_hex=None,
+    target_width=None,
+    target_height=None,
+    auto_crop=False,
+    padding_percent=0,
+    max_upscale=1.0,
+):
     """
     bg_color_hex = None  -> Transparent canvas.
     bg_color_hex = "#FFFFFF" -> White background canvas.
+
+    auto_crop=True crops to the detected product first and centres it with
+    ``padding_percent`` free space on each side, so every catalogue image is
+    framed the same way regardless of how the photo was shot.
     """
     target_width = target_width or TARGET_WIDTH
     target_height = target_height or TARGET_HEIGHT
 
     if image.mode != "RGBA":
         image = image.convert("RGBA")
+    else:
+        image = image.copy()
 
-    image.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+    if auto_crop:
+        image = crop_to_product(image)
+        pad = min(max(float(padding_percent or 0), 0.0), 40.0) / 100.0
+        inner_w = max(1, round(target_width * (1 - 2 * pad)))
+        inner_h = max(1, round(target_height * (1 - 2 * pad)))
+        scale = min(inner_w / image.width, inner_h / image.height)
+        scale = min(scale, max(float(max_upscale or 1.0), 1.0))
+        new_size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+        if new_size != image.size:
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+    else:
+        image.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
 
     if bg_color_hex:
         bg = hex_to_rgb(bg_color_hex)
@@ -1041,7 +1148,7 @@ def process_images(request):
     if transparent_only:
         mapping, category_map, style_map = {}, {}, {}
     else:
-        mapping, category_map, style_map = read_excel_mapping(excel_file)
+        mapping, category_map, style_map = read_excel_mapping_cached(excel_file)
     results = []
 
     for img_file in images:
@@ -1109,6 +1216,7 @@ def process_images(request):
             # ---------------------------
             # Remove background and preserve product colour
             # ---------------------------
+            detection = None
             reference_matte = (
                 item_override.get("reference_matte")
                 if isinstance(item_override, dict)
@@ -1130,11 +1238,21 @@ def process_images(request):
                     repair_regions=item_override.get("repair_regions"),
                 )
             else:
-                transparent_im = remove_background(
+                transparent_im, detection = remove_background_detailed(
                     im,
-                    bg_settings=bg_settings,
+                    bg_settings={
+                        **bg_settings,
+                        "_validation": preset.get("validation", {}),
+                    },
                     product_protection=product_protection,
                 )
+                if not detection.bbox and preset.get("validation", {}).get("require_product_visible", True):
+                    results.append({
+                        "file": filename,
+                        "status": "skipped",
+                        "reason": "No jewellery detected in the photo",
+                    })
+                    continue
 
             width = int(output_settings.get("width_px", TARGET_WIDTH) or TARGET_WIDTH)
             height = int(output_settings.get("height_px", TARGET_HEIGHT) or TARGET_HEIGHT)
@@ -1154,9 +1272,22 @@ def process_images(request):
             # ---------------------------
             # White Canvas
             # ---------------------------
-            white_canvas = resize_to_canvas(transparent_im, bg_color_hex or canvas_color or "#FFFFFF", width, height)
+            white_canvas = resize_to_canvas(
+                transparent_im,
+                bg_color_hex or canvas_color or "#FFFFFF",
+                width,
+                height,
+                auto_crop=bool(image_settings.get("auto_crop", False)),
+                padding_percent=(
+                    image_settings.get("padding_percent", 0)
+                    if image_settings.get("add_padding", True)
+                    else 0
+                ),
+                max_upscale=float(image_settings.get("max_upscale", 2.0)),
+            )
 
-            preview = image_to_base64(white_canvas)
+            # Small JPEG thumbnail for the browser; the full files are on disk.
+            preview = image_to_base64_jpeg(thumbnail(white_canvas, 900), quality=88)
 
             # Add catalogue text only when Excel metadata exists.
             if lines:
@@ -1178,15 +1309,30 @@ def process_images(request):
                 dpi=(300, 300)
             )
 
+            extra = {
+                "preview_mime": "image/png" if transparent_only else "image/jpeg",
+                "transparent_url": media_url_for(transparent_path),
+                "warnings": list(detection.warnings) if detection else [],
+                "detection": (
+                    detection.as_dict(im.width, im.height) if detection else None
+                ),
+                "detection_preview": (
+                    image_to_base64_jpeg(draw_detection_overlay(im, detection.boxes))
+                    if detection and detection.boxes
+                    else None
+                ),
+            }
+
             if transparent_only:
                 results.append({
                     "file": filename,
                     "status": "success",
-                    "preview": image_to_base64(transparent_canvas),
+                    "preview": image_to_base64(thumbnail(transparent_canvas, 900, crop=True)),
                     "transparent_path": str(transparent_path),
                     "category": "",
                     "style": "",
                     "preset": preset_name,
+                    **extra,
                 })
                 continue
 
@@ -1247,7 +1393,8 @@ def process_images(request):
                 "preset": preset_name,
                 "transparent_path": str(transparent_path),
                 "category_path": str(cat_path),
-                "stylebio_path": str(style_path)
+                "stylebio_path": str(style_path),
+                **extra,
             })
 
         except Exception as e:

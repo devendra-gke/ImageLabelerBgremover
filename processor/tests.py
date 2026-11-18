@@ -39,3 +39,156 @@ class JewelryBackgroundRemovalTests(TestCase):
         self.assertIn("1001", mapping)
         self.assertEqual(mapping["1001"], ["SB-202", "1001", "0.90", "0.10", "12.50", "1.20"])
         self.assertEqual(category_map["1001"], "RING")
+
+
+# ----------------------------------------------------------------------
+# Jewellery detection / matte clean-up / 3D (no AI model needed: the
+# segmentation call is replaced with a deterministic fake).
+# ----------------------------------------------------------------------
+from unittest import mock
+
+import numpy as np
+from django.core.files.uploadedfile import SimpleUploadedFile
+
+
+def _ring_photo(w=900, h=700, cx=600, cy=380, r_out=120, r_in=95):
+    """Gold ring on a vignetted light-grey backdrop, plus dust specks."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    bg = 240 - 18 * np.hypot((xx - w / 2) / w, (yy - h / 2) / h)
+    img = np.repeat(bg[..., None], 3, axis=2)
+    dist = np.hypot(xx - cx, yy - cy)
+    band = (dist <= r_out) & (dist >= r_in)
+    img[band] = (205, 160, 70)
+    img[100:102, 100:102] = 120          # dust speck far away
+    return Image.fromarray(img.astype(np.uint8)), band, dist < r_in
+
+
+def _fake_model(image, model_name):
+    """A 'model' that fills the ring hole (a typical failure) at low precision."""
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    gold = (arr[..., 0] - arr[..., 2]) > 60
+    from scipy.ndimage import binary_fill_holes
+    filled = binary_fill_holes(gold)
+    alpha = (filled * 255).astype(np.uint8)
+    speck = (np.abs(arr - 120).max(axis=2) < 5)
+    alpha[speck] = 255
+    return alpha
+
+
+class JewelleryDetectionTests(TestCase):
+    def setUp(self):
+        patcher = mock.patch(
+            "processor.services.jewellery_detection.predict_alpha",
+            side_effect=_fake_model,
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_detects_ring_box_and_clears_hole_and_speck(self):
+        from processor.services.jewellery_detection import cutout_jewellery
+
+        photo, band, hole = _ring_photo()
+        result = cutout_jewellery(photo, {})
+        x0, y0, x1, y1 = result.bbox
+        self.assertTrue(470 <= x0 <= 490 and 710 <= x1 <= 730, result.bbox)
+        self.assertTrue(250 <= y0 <= 270 and 490 <= y1 <= 510, result.bbox)
+        self.assertTrue(result.refined)
+        # the band stays solid, the hollow and the dust are removed
+        self.assertGreater((result.alpha[band] > 200).mean(), 0.97)
+        self.assertLess((result.alpha[hole] > 0).mean(), 0.02)
+        self.assertEqual(result.alpha[100:102, 100:102].max(), 0)
+
+    def test_no_jewellery_returns_empty_detection(self):
+        from processor.services.jewellery_detection import cutout_jewellery
+
+        blank = Image.new("RGB", (400, 300), (240, 240, 240))
+        result = cutout_jewellery(blank, {})
+        self.assertIsNone(result.bbox)
+        self.assertTrue(result.warnings)
+
+    def test_auto_crop_frames_product_with_padding(self):
+        from processor.services.image_processor import resize_to_canvas
+
+        rgba = Image.new("RGBA", (1000, 800), (0, 0, 0, 0))
+        rgba.paste((200, 150, 60, 255), (100, 100, 200, 150))
+        canvas = resize_to_canvas(rgba, "#FFFFFF", 1750, 1160, auto_crop=True, padding_percent=10, max_upscale=20)
+        arr = np.asarray(canvas)
+        ys, xs = np.nonzero(arr[..., 0] < 250)
+        # product width fills 80% of the canvas width (10% padding each side)
+        self.assertAlmostEqual((xs.max() - xs.min() + 1) / 1750, 0.8, delta=0.01)
+
+    def test_make_3d_endpoint_returns_textures(self):
+        photo, _, _ = _ring_photo()
+        buffer = io.BytesIO()
+        photo.save(buffer, format="PNG")
+        upload = SimpleUploadedFile("ring.png", buffer.getvalue(), content_type="image/png")
+        response = self.client.post("/make-3d/", {"image": upload, "depth_mode": "shape"})
+        self.assertEqual(response.status_code, 200, response.content[:300])
+        data = response.json()
+        self.assertEqual(data["depth_mode"], "shape")
+        import base64
+        depth = Image.open(io.BytesIO(base64.b64decode(data["depth"])))
+        self.assertEqual(depth.size, (data["width"], data["height"]))
+        packed = np.asarray(depth).astype(np.uint32)
+        height = (packed[..., 0] << 8) | packed[..., 1]
+        self.assertGreater(height.max(), 30000)          # the band is raised
+        cutout = Image.open(io.BytesIO(base64.b64decode(data["cutout"])))
+        a = np.asarray(cutout.getchannel("A"))
+        self.assertEqual(int(height[a == 0].max()), 0)   # backdrop stays flat
+
+    def test_process_images_transparent_mode_reports_detection(self):
+        photo, _, _ = _ring_photo()
+        buffer = io.BytesIO()
+        photo.save(buffer, format="PNG")
+        upload = SimpleUploadedFile("ring_TEST-1.png", buffer.getvalue(), content_type="image/png")
+        response = self.client.post("/process-images/", {"images": upload, "processing_mode": "transparent_only"})
+        item = response.json()["data"][0]
+        self.assertEqual(item["status"], "success", item)
+        self.assertEqual(item["detection"]["parts"], 1)
+        self.assertTrue(item["transparent_url"].endswith("/Transparent/ring_TEST-1.png"))
+        self.assertTrue(item["detection_preview"])
+
+
+class DiamondShineTests(TestCase):
+    """Stones must come out fully opaque even when the model leaves them
+    semi-transparent (they reflect the backdrop); a backdrop gap between two
+    settings must still be cleared."""
+
+    def _scene(self):
+        rng = np.random.default_rng(1)
+        h, w = 400, 600
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        img = np.zeros((h, w, 3), np.float32)
+        img[:] = (182, 175, 192)                                   # lavender backdrop
+        stones = [(250, 200), (350, 200)]
+        bezel = np.zeros((h, w), bool)
+        stone = np.zeros((h, w), bool)
+        for cx, cy in stones:
+            d = np.hypot(xx - cx, yy - cy)
+            ring = (d <= 40) & (d > 30)
+            bezel |= ring
+            img[ring] = (215, 160, 140)                             # rose gold
+            st = d <= 30
+            stone |= st
+            facets = 175 + 60 * np.sign(np.sin(np.arctan2(yy - cy, xx - cx) * 8)) + rng.normal(0, 12, (h, w))
+            img[st] = np.stack([facets, facets - 4, facets + 10], -1)[st]
+            img[(np.hypot(xx - cx + 8, yy - cy + 8) < 4)] = 255       # sparkle
+        bar = (np.abs(yy - 200) < 5) & (xx > 280) & (xx < 320)    # metal bar joining the bezels
+        img[bar] = (215, 160, 140)
+        gap = (np.abs(xx - 300) < 6) & (np.abs(yy - 228) < 8)       # backdrop gap under the bar
+        return Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)), bezel, stone, bar, gap
+
+    def test_stones_become_opaque_and_gap_clears(self):
+        from processor.services import hole_cleanup
+
+        photo, bezel, stone, bar, gap = self._scene()
+        alpha = np.zeros(stone.shape, np.uint8)
+        alpha[bezel | bar] = 255
+        alpha[stone] = 120                       # model unsure about the diamonds
+        # model also fills the region between the bezels (incl. the gap)
+        between = np.zeros_like(stone)
+        between[185:245, 285:315] = True
+        alpha[between & ~stone & ~bezel] = 250
+        cleaned, stats, _ = hole_cleanup.clean_matte(np.asarray(photo), alpha, {})
+        self.assertGreater((cleaned[stone] >= 250).mean(), 0.97, stats)
+        self.assertLess((cleaned[gap] > 0).mean(), 0.2, stats)
