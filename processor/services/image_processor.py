@@ -158,6 +158,54 @@ def remove_background_huggingface(image: Image.Image) -> Image.Image:
 
 
 
+def _preserve_in_strips(crop_rgb, result, protection, foreground_rgb, backdrop,
+                        strip_rows: int = 1024, overlap: int = 64):
+    """Run preserve_original_product_pixels on horizontal strips.
+
+    Every operation in it reaches at most a few pixels (highlight distance,
+    facet edges), so overlapping strips give the same result while peak
+    memory stays small even for 30+ MP crops (a whole-crop pass needed ~6 GB).
+    """
+    w, h = crop_rgb.size
+    if w * h <= 8_000_000:
+        return preserve_original_product_pixels(
+            crop_rgb, result, protection, estimated_rgb=foreground_rgb, backdrop=backdrop)
+    out = np.empty((h, w, 4), np.uint8)
+    for sy in range(0, h, strip_rows):
+        ey = min(h, sy + strip_rows)
+        py0, py1 = max(0, sy - overlap), min(h, ey + overlap)
+        part = preserve_original_product_pixels(
+            crop_rgb.crop((0, py0, w, py1)),
+            result.crop((0, py0, w, py1)),
+            protection,
+            estimated_rgb=None if foreground_rgb is None else foreground_rgb[py0:py1],
+            backdrop=None if backdrop is None else backdrop[py0:py1],
+        )
+        out[sy:ey] = np.asarray(part, dtype=np.uint8)[sy - py0:ey - py0]
+    return Image.fromarray(out, mode="RGBA")
+
+
+def decontaminate_edges(rgba: np.ndarray, background_small: np.ndarray) -> int:
+    """Remove the backdrop colour mixed into semi-transparent edge pixels.
+
+    An edge pixel with alpha a shows a*product + (1-a)*backdrop. With the
+    local backdrop colour B known, the product colour is (I - (1-a)B) / a.
+    Without this, cutouts get a light/grey glow on dark pages.
+    """
+    a = rgba[..., 3]
+    edge = (a > 0) & (a < 250)
+    if not edge.any():
+        return 0
+    ys, xs = np.nonzero(edge)
+    h, w = a.shape
+    bg = cv2.resize(background_small, (w, h), interpolation=cv2.INTER_LINEAR)[ys, xs]
+    af = (a[ys, xs].astype(np.float32) / 255.0)[:, None]
+    src = rgba[ys, xs, :3].astype(np.float32)
+    fg = (src - (1.0 - af) * bg) / np.maximum(af, 0.15)
+    rgba[ys, xs, :3] = np.clip(fg, 0, 255).astype(np.uint8)
+    return int(len(ys))
+
+
 def _distance_to(mask: np.ndarray) -> np.ndarray:
     """Euclidean distance of every pixel to the nearest True pixel in mask.
 
@@ -174,10 +222,17 @@ def preserve_original_product_pixels(
     processed: Image.Image,
     product_protection: dict | None = None,
     estimated_rgb: np.ndarray | None = None,
+    backdrop: np.ndarray | None = None,
 ) -> Image.Image:
     """
     Preserve original jewellery colours and shine.
     Keep source RGB and model alpha, with optional conservative edge cleanup.
+
+    ``backdrop`` (local backdrop colour per pixel) makes sparkle/facet
+    recovery relative to the backdrop: on a light studio backdrop (~210+),
+    fixed brightness thresholds would otherwise treat the backdrop next to
+    the product - and the camera's sharpening halo - as diamond sparkle and
+    paint a light outline around the piece.
     """
     product_protection = product_protection or {}
 
@@ -196,6 +251,20 @@ def preserve_original_product_pixels(
     alpha_u8 = rgba[..., 3].astype(np.uint8)
     initial_alpha_u8 = alpha_u8.copy()
     alpha = alpha_u8 / 255.0
+
+    # Pixels that clearly stand out from the local backdrop. Without a
+    # backdrop estimate every pixel is eligible (previous behaviour).
+    if backdrop is not None:
+        luma_src = src @ np.array([0.299, 0.587, 0.114], np.float32)
+        luma_bg = backdrop @ np.array([0.299, 0.587, 0.114], np.float32)
+        brighter_than_backdrop = (luma_src - luma_bg) >= float(
+            product_protection.get("sparkle_backdrop_margin", 25))
+        diff = src - backdrop
+        differs_from_backdrop = np.sqrt((diff * diff).sum(axis=2)) >= float(
+            product_protection.get("facet_backdrop_contrast", 30))
+    else:
+        brighter_than_backdrop = np.ones(alpha_u8.shape, bool)
+        differs_from_backdrop = brighter_than_backdrop
 
     # Use the PyMatting estimate when supplied. This keeps decontaminated
     # edge colour while the recovery logic below protects fine product detail.
@@ -242,7 +311,7 @@ def preserve_original_product_pixels(
             highlight_threshold = float(
                 product_protection.get("highlight_threshold", 228)
             )
-            highlight_mask = np.max(src, axis=2) >= highlight_threshold
+            highlight_mask = (np.max(src, axis=2) >= highlight_threshold) & brighter_than_backdrop
             eligible = edge & (~highlight_mask)
 
             if np.any(eligible):
@@ -311,7 +380,7 @@ def preserve_original_product_pixels(
             # Protect only bright pixels close to the nearest existing
             # product border. This preserves diamond shine while preventing
             # white studio background from being pulled into the cutout.
-            sparkle = np.max(src, axis=2) >= highlight_threshold
+            sparkle = (np.max(src, axis=2) >= highlight_threshold) & brighter_than_backdrop
             uncertain = alpha_u8 < 245
             alpha_seed = int(
                 product_protection.get("highlight_alpha_seed", 8)
@@ -408,7 +477,7 @@ def preserve_original_product_pixels(
 
         distance_to_body = _distance_to(initial_alpha_u8 >= body_seed)
         near_body = distance_to_body <= max_haze_distance
-        bright_sparkle = np.max(src, axis=2) >= haze_highlight_threshold
+        bright_sparkle = (np.max(src, axis=2) >= haze_highlight_threshold) & brighter_than_backdrop
 
         haze = (
             (alpha_u8 > 0)
@@ -456,6 +525,7 @@ def preserve_original_product_pixels(
             & (edge_map >= facet_edge_threshold)
             & (gray >= facet_brightness_threshold)
             & (expanded_alpha > 0)
+            & differs_from_backdrop
         )
 
         alpha_u8[facet_mask] = np.maximum(
@@ -1010,15 +1080,17 @@ def remove_background_detailed(
         np.dstack([foreground_rgb, np.asarray(alpha, dtype=np.uint8)]),
         mode="RGBA",
     )
+    backdrop = None
+    if detection.background_small is not None:
+        backdrop = cv2.resize(
+            detection.background_small, crop_rgb.size, interpolation=cv2.INTER_LINEAR)
     if protect:
-        result = preserve_original_product_pixels(
-            crop_rgb,
-            result,
-            protection,
-            estimated_rgb=foreground_rgb,
-        )
+        result = _preserve_in_strips(crop_rgb, result, protection, foreground_rgb, backdrop)
 
-    output[y0:y1, x0:x1] = np.asarray(result, dtype=np.uint8)
+    result_arr = np.asarray(result, dtype=np.uint8).copy()
+    if (bg_settings or {}).get("decontaminate_edges", True) and detection.background_small is not None:
+        decontaminate_edges(result_arr, detection.background_small)
+    output[y0:y1, x0:x1] = result_arr
     detection.timings["protect_s"] = round(time.perf_counter() - t0, 2)
     return Image.fromarray(output, mode="RGBA"), detection
 

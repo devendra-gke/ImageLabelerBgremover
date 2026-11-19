@@ -49,6 +49,7 @@ DETECTION_DEFAULTS = {
 @dataclass
 class CutoutResult:
     alpha_roi: np.ndarray | None = None             # matte inside ``roi``
+    background_small: np.ndarray | None = None      # local backdrop colour of the roi, 1/4 size
     roi: tuple = (0, 0, 0, 0)                       # x0, y0, x1, y1 in the photo
     size: tuple = (0, 0)                            # photo (w, h)
     boxes: list = field(default_factory=list)       # [x0, y0, x1, y1] px, per item
@@ -297,6 +298,9 @@ def cutout_jewellery(image: Image.Image, bg_settings: dict | None = None) -> Cut
 
     result.alpha_roi = alpha
     result.roi = (x0, y0, x1, y1)
+    bh, bw = ctx.bg.shape[:2]
+    result.background_small = cv2.resize(
+        ctx.bg, (max(1, bw // 4), max(1, bh // 4)), interpolation=cv2.INTER_AREA)
     result.cleanup = stats
     result.timings = timings
     final_boxes, final_union = boxes_from_alpha(alpha, offset=(x0, y0))

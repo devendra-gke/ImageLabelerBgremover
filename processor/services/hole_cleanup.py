@@ -47,12 +47,59 @@ DEFAULTS = {
     "hole_bright_tolerance": 6.0,
     "hole_small_match_tolerance": 24.0,   # small model-filled gaps must match the backdrop this closely
     "backdrop_texture_max": 14.0,
-    "gap_border_min_saturation": 0.12,    # small filled gaps are cleared only when bordered by coloured metal         # local contrast: backdrop is smooth, faceted stones are not
+    "gap_border_min_saturation": 0.12,
+    "exact_backdrop_tolerance": 9.0,      # region matches local backdrop this closely ...
+    "exact_backdrop_flatness": 5.0,       # ... and is this flat -> always a hollow
+    "local_backdrop_radius": 0.02,        # fraction of diagonal used to sample nearby backdrop
+    "full_res_cleanup_max_px": 12_000_000,
+    # plain-backdrop openings in any frame (white gold / pave included)
+    "open_backdrop_hollows": True,
+    "protect_stone_reflections": True,
+    "reflection_min_dist": 8.0,           # cut region differs from local backdrop by more than this (median) ...
+    "reflection_max_lum": -2.5,           # ... and is darker than it -> a stone facet, restored
+    "reflection_model_alpha": 140,        # only where the model was confident it is product
+    "hollow_seed_tolerance": 11.0,        # seed pixels match the local backdrop this closely
+    "hollow_grow_tolerance": 24.0,
+    "hollow_max_mean_dist": 12.0,  # bigger crops: decisions on a reduced copy (much faster)
+    # edge refinement (guided filter at native resolution)
+    "refine_edges": True,
+    "edge_radius_ratio": 0.0005,          # guided-filter radius, fraction of diagonal (~4 px at 6720 px)
+    "edge_eps": 0.001,
+    "edge_contrast": 2.0,                 # >1 tightens the soft transition (crisper edge)
+    # small pockets inside coloured-metal chains (link holes)
+    "open_metal_pockets": True,
+    "pocket_max_area_ratio": 0.00003,
+    "pocket_dark_guard": 40.0,            # a pocket with pixels this much darker than backdrop is a stone    # small filled gaps are cleared only when bordered by coloured metal         # local contrast: backdrop is smooth, faceted stones are not
     # stones / settings
     "solidify_stones": True,
     "stone_max_area_ratio": 0.002,        # an enclosed region bigger than this is never a stone
     "stone_edge_px_ratio": 0.0012,        # keep the soft outer edge this wide (fraction of diagonal)
     "stone_size_ratio": 0.004,            # typical stone diameter (fraction of diagonal) for notch filling
+    "flat_region_min_stone_areas": 0.35,  # open backdrop patch: min area (in stone areas)
+    "open_backdrop_max_fine": 3.0,        # a patch this flat and ...
+    "open_backdrop_max_dist": 26.0,        # ... this close to the exterior backdrop is not a stone reflection
+    "clear_flat_backdrop": True,          # final: solid pale backdrop blobs left opaque become clear
+    "flat_backdrop_dist": 60.0,
+    "flat_backdrop_chroma": 0.04,
+    "flat_backdrop_open": 7,
+    "flat_backdrop_min_area": 120,
+    "flat_backdrop_ref_px": 3000,
+    "clear_backdrop_haze": True,          # final: semi-transparent backdrop-coloured pixels become clear
+    "haze_color_tolerance": 14.0,
+    "haze_chroma": 0.03,
+    "haze_max_brighter": 5.0,
+    "remove_thin_gaps": True,             # clear narrow backdrop strips between metal strands
+    "thin_gap_tolerance": 38.0,           # max colour distance from the backdrop (strips are tinted by the metal)
+    "thin_gap_chroma": 0.03,              # max hue difference
+    "thin_gap_max_darker": 30.0,          # max brightness below the backdrop
+    "thin_gap_max_brighter": 22.0,        # max brightness above the backdrop (spill from polished wire)
+    "thin_gap_half_width_ratio": 0.0011,  # widest strip, half-width as fraction of diagonal
+    "thin_gap_elongation": 3.0,           # strips are long, stones are compact
+    "band_color_tolerance": 16.0,         # flat backdrop patch: max colour distance from the local backdrop
+    "band_flat_texture": 3.5,             # ... and max 5x5 local contrast
+    "band_chroma_tolerance": 0.025,       # ... and max hue difference
+    "band_min_area_ratio": 0.12,          # smallest patch (fraction of one stone's area) that counts as backdrop
+    "band_reach_ratio": 0.0012,           # rim around such a patch that is also kept clear (fraction of diagonal)
     # contour hierarchy
     "contour_hole_min_area_px": 16,
     "contour_hole_alpha_threshold": 8,
@@ -178,6 +225,7 @@ class MatteContext:
         else:
             far_px = float(cfg["background_far_px"]) * float(np.hypot(h, w))
             self.bg = background_model(self.src, alpha, far_px)
+        self.bg = self._local_backdrop(alpha, self.bg)
         diff = cv2.subtract(self.src, self.bg)
         # per-pixel colour distance; cv2.transform sums channels multi-threaded
         self.color_dist = cv2.sqrt(cv2.transform(cv2.multiply(diff, diff), np.ones((1, 3), np.float32)))
@@ -187,6 +235,39 @@ class MatteContext:
         self.lum_diff = cv2.transform(cv2.subtract(self.src, self.bg), np.full((1, 3), 1 / 3.0, np.float32))
         self._backdrop_like = None
         self._chroma_diff = None
+
+    def _local_backdrop(self, alpha: np.ndarray, smooth_bg: np.ndarray) -> np.ndarray:
+        """Blend the smooth backdrop surface with the backdrop actually seen
+        nearby. Studio lighting varies (reflector spill, light fall-off near
+        the product), so a hollow is compared with the backdrop around *it*,
+        not with a whole-photo average."""
+        h, w = alpha.shape
+        clear = (alpha <= 2).astype(np.uint8)
+        clear = cv2.erode(clear, np.ones((5, 5), np.uint8))       # keep off the product edge
+        if clear.sum() < 50:
+            return smooth_bg
+        scale = min(1.0, 768.0 / max(h, w))
+        sw, sh = max(1, int(w * scale)), max(1, int(h * scale))
+        src_s = cv2.resize(self.src, (sw, sh), interpolation=cv2.INTER_AREA)
+        m_s = cv2.resize(clear.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA)
+        m_s = (m_s > 0.99).astype(np.float32)
+        radius = max(3, int(round(float(self.cfg["local_backdrop_radius"]) * self.diag * scale)))
+        k = (2 * radius + 1, 2 * radius + 1)
+        weight = cv2.blur(m_s, k)
+        acc = cv2.blur(src_s * m_s[..., None], k)
+        local = acc / np.maximum(weight, 1e-6)[..., None]
+        trust = np.clip(weight / 0.05, 0, 1)[..., None]
+        smooth_s = cv2.resize(smooth_bg, (sw, sh), interpolation=cv2.INTER_AREA)
+        blended = local * trust + smooth_s * (1 - trust)
+        return cv2.resize(blended, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+    @property
+    def fine_texture(self) -> np.ndarray:
+        """Local contrast over a small fixed 5x5 window (for small hollows such
+        as chain-link holes, which are narrower than the scaled window)."""
+        if getattr(self, "_fine_texture", None) is None:
+            self._fine_texture = _local_std(self.gray, 5)
+        return self._fine_texture
 
     @property
     def backdrop_like(self) -> np.ndarray:
@@ -259,7 +340,7 @@ def remove_enclosed_background(ctx: MatteContext, alpha: np.ndarray) -> int:
     core = (
         (ctx.color_dist < float(cfg["hole_core_tolerance"]) * 1.25)
         & (ctx.grad < float(cfg["hole_flat_gradient"]))
-        & (ctx.texture < float(cfg["backdrop_texture_max"]))
+        & (ctx.fine_texture < float(cfg["backdrop_texture_max"]))
         & (alpha > 0)
     ).astype(np.uint8)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=4)
@@ -289,15 +370,25 @@ def remove_enclosed_background(ctx: MatteContext, alpha: np.ndarray) -> int:
     mean_lum = lum_sum / np.maximum(areas, 1)
     tex_sum = np.bincount(flat_labels, weights=ctx.texture.ravel().astype(np.float64), minlength=count)
     mean_tex = tex_sum / np.maximum(areas, 1)
+    fine_sum = np.bincount(flat_labels, weights=ctx.fine_texture.ravel().astype(np.float64), minlength=count)
+    mean_fine = fine_sum / np.maximum(areas, 1)
     tex_max = float(cfg["backdrop_texture_max"])
+    exact_tol = float(cfg["exact_backdrop_tolerance"])
+    exact_flat = float(cfg["exact_backdrop_flatness"])
     bright_tol = float(cfg.get("hole_bright_tolerance", 6.0))
 
     chosen = []
     for idx in candidate_ids:
+        # Flat and indistinguishable from the nearby backdrop: a hollow,
+        # whatever frames it (white-gold pave included). Stones and polished
+        # metal are never this flat *and* this close to the backdrop colour.
+        if mean_dist[idx] < exact_tol and mean_fine[idx] < exact_flat and abs(mean_lum[idx]) < exact_tol:
+            chosen.append(idx)
+            continue
         brighter_than_backdrop = mean_lum[idx] > bright_tol
         if brighter_than_backdrop and mean_alpha[idx] > 24:
             continue  # facet / highlight, not a hollow
-        if mean_tex[idx] >= tex_max and mean_alpha[idx] > 24:
+        if min(mean_tex[idx], mean_fine[idx] * 1.5) >= tex_max and mean_alpha[idx] > 24:
             continue  # textured: part of a stone reflecting the backdrop
         model_says_hole = mean_alpha[idx] < 96
         # The model kept it solid. Only override for a big, very flat region
@@ -360,6 +451,363 @@ def _bordered_by_coloured_metal(ctx, labels, stats, idx, alpha, cfg) -> bool:
     mx, mn = rgb.max(axis=1), rgb.min(axis=1)
     saturation = (mx - mn) / np.maximum(mx, 1.0)
     return float(np.median(saturation)) >= float(cfg["gap_border_min_saturation"])
+
+
+def _box(x: np.ndarray, r: int) -> np.ndarray:
+    return cv2.blur(x, (2 * r + 1, 2 * r + 1))
+
+
+def refine_edges(ctx: MatteContext, alpha: np.ndarray) -> int:
+    """Snap the matte to the real edges of the photo (see refine_edges_core)."""
+    if not ctx.cfg["refine_edges"]:
+        return 0
+    return refine_edges_core(ctx.src, alpha, ctx.bg, ctx.cfg, ctx.diag)
+
+
+def _guided_strip(src, bg, alpha, r, sub, cfg) -> np.ndarray:
+    S = src.astype(np.float32)
+    B = bg.astype(np.float32, copy=False)
+    diff = cv2.subtract(S, B)
+    ones = np.ones((1, 3), np.float32)
+    d = cv2.sqrt(cv2.transform(cv2.multiply(diff, diff), ones))
+    lum = cv2.transform(diff, np.full((1, 3), 1 / 3.0, np.float32))
+    del diff
+    s_sum = cv2.add(cv2.transform(S, ones), 1.0)
+    b_sum = cv2.add(cv2.transform(B, ones), 1.0)
+    cd = cv2.absdiff(cv2.divide(S, cv2.merge([s_sum] * 3)), cv2.divide(B, cv2.merge([b_sum] * 3)))
+    c0, c1, c2 = cv2.split(cd)
+    chroma = cv2.max(cv2.max(c0, c1), c2)
+    del cd, c0, c1, c2, S
+    # Camera sharpening leaves a thin halo of *brighter*, neutral backdrop
+    # next to dark or gold edges (and inside chain links); discount it so the
+    # matte does not grow a light outline. Clearly brighter pixels (diamonds,
+    # white metal) still count.
+    halo = (lum > 0) & (chroma < 0.03)
+    d = np.where(halo, np.maximum(d - float(cfg.get("edge_halo_allowance", 35.0)), 0), d)
+    I = np.clip(d / 60.0, 0, 1).astype(np.float32)
+    p = alpha.astype(np.float32) / 255.0
+    eps = float(cfg["edge_eps"])
+    hh, ww = I.shape
+    if sub > 1 and hh >= 2 * sub and ww >= 2 * sub:
+        Is = cv2.resize(I, (ww // sub, hh // sub), interpolation=cv2.INTER_AREA)
+        ps = cv2.resize(p, (ww // sub, hh // sub), interpolation=cv2.INTER_AREA)
+        rs = max(1, r // sub)
+    else:
+        Is, ps, rs, sub = I, p, r, 1
+    mI, mp = _box(Is, rs), _box(ps, rs)
+    cov = _box(Is * ps, rs) - mI * mp
+    var = _box(Is * Is, rs) - mI * mI
+    ca = cov / (var + eps)
+    cb = mp - ca * mI
+    ma, mb = _box(ca, rs), _box(cb, rs)
+    if sub > 1:
+        ma = cv2.resize(ma, (ww, hh), interpolation=cv2.INTER_LINEAR)
+        mb = cv2.resize(mb, (ww, hh), interpolation=cv2.INTER_LINEAR)
+    q = np.clip(ma * I + mb, 0, 1)
+    k_contrast = float(cfg["edge_contrast"])
+    if k_contrast > 1.0:
+        # tighten the transition around 50 % so the edge reads as crisp
+        # (about half the width) while staying anti-aliased
+        q = np.clip((q - 0.5) * k_contrast + 0.5, 0, 1)
+    return q
+
+
+def refine_edges_core(src: np.ndarray, alpha: np.ndarray, bg: np.ndarray, cfg: dict, diag: float) -> int:
+    """Guided-filter edge refinement (He et al.) at native resolution.
+
+    The model's matte is computed at ~1024 px and stretched to the crop, so
+    on large photos its edges are soft and stair-stepped. The matte is
+    re-fitted locally as a linear function of a guide image: "how different
+    is this pixel from the local backdrop", which separates gold, stones and
+    beads from the backdrop far better than brightness alone. Only a band
+    around the existing edges changes. On big crops the filter coefficients
+    are computed at half resolution (fast guided filter) and applied with the
+    full-resolution guide, so edges stay native-sharp.
+    """
+    r = max(2, int(round(float(cfg["edge_radius_ratio"]) * diag)))
+    solid = (alpha >= 128).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    edge = cv2.morphologyEx(solid, cv2.MORPH_GRADIENT, k).astype(bool) | ((alpha > 8) & (alpha < 247))
+    if not edge.any():
+        return 0
+    band = cv2.dilate(edge.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4 * r + 1, 4 * r + 1))).astype(bool)
+    ys, xs = np.nonzero(band)
+    y0, y1 = max(0, ys.min() - 2 * r), min(alpha.shape[0], ys.max() + 2 * r + 1)
+    x0, x1 = max(0, xs.min() - 2 * r), min(alpha.shape[1], xs.max() + 2 * r + 1)
+
+    hh, ww = y1 - y0, x1 - x0
+    sub = 2 if hh * ww > 4_000_000 and r >= 4 else 1
+    # Process in horizontal strips (identical result thanks to the overlap,
+    # but memory stays flat even for a 30+ MP crop).
+    overlap = 4 * r + 4
+    overlap += overlap % 2
+    strip = 1024
+    q = np.empty((hh, ww), np.float32)
+    for sy in range(0, hh, strip):
+        ey = min(hh, sy + strip)
+        py0, py1 = max(0, sy - overlap), min(hh, ey + overlap)
+        q[sy:ey] = _guided_strip(
+            src[y0 + py0:y0 + py1, x0:x1], bg[y0 + py0:y0 + py1, x0:x1],
+            alpha[y0 + py0:y0 + py1, x0:x1], r, sub, cfg)[sy - py0:ey - py0]
+    sub_band = band[y0:y1, x0:x1]
+    new = (q * 255 + 0.5).astype(np.uint8)
+    region = alpha[y0:y1, x0:x1]
+    changed = int((region[sub_band] != new[sub_band]).sum())
+    region[sub_band] = new[sub_band]
+    return changed
+
+
+def open_metal_pockets(ctx: MatteContext, alpha: np.ndarray) -> int:
+    """Open the small backdrop pockets inside chain links.
+
+    Through a cable chain you see the backdrop, often a little *brighter*
+    than elsewhere (lens sharpening halo), so the regular hollow rule does not
+    apply. A pocket is opened only if it is small, neutral like the backdrop
+    (not gold), flat, framed by coloured metal - and contains no dark pixels:
+    every diamond, even a tiny melee, has dark facets.
+    """
+    cfg = ctx.cfg
+    if not cfg["open_metal_pockets"]:
+        return 0
+    cand = (
+        (alpha > 0)
+        & (ctx.chroma_diff < 0.03)
+        & (ctx.lum_diff > -20)
+        & (ctx.color_dist < 50)
+    ).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=4)
+    if count <= 1:
+        return 0
+    max_area = float(cfg["pocket_max_area_ratio"]) * ctx.area
+    # dark AND neutral = diamond facet / pavilion (gold shading is coloured)
+    dark = ((ctx.lum_diff < -float(cfg["pocket_dark_guard"])) & (ctx.chroma_diff < 0.04)).astype(np.uint8)
+    dark_near = cv2.dilate(dark, np.ones((5, 5), np.uint8)).ravel()
+    flat = labels.ravel()
+    areas = stats[:, cv2.CC_STAT_AREA]
+    has_dark = np.bincount(flat, weights=dark_near.astype(np.float64), minlength=count) > 0
+    fine = np.bincount(flat, weights=ctx.fine_texture.ravel().astype(np.float64), minlength=count) / np.maximum(areas, 1)
+    chosen = []
+    for idx in range(1, count):
+        if areas[idx] < 4 or areas[idx] > max_area or has_dark[idx] or fine[idx] > 16:
+            continue
+        x, y, w, h = stats[idx, :4]
+        if x == 0 or y == 0 or x + w == alpha.shape[1] or y + h == alpha.shape[0]:
+            continue
+        if _bordered_by_coloured_metal(ctx, labels, stats, idx, alpha, cfg):
+            chosen.append(idx)
+    if not chosen:
+        return 0
+    pocket = np.isin(labels, chosen)
+    alpha[pocket] = 0
+    return int(pocket.sum())
+
+
+def remove_thin_gaps(ctx: MatteContext, alpha: np.ndarray) -> int:
+    """Clear narrow strips of backdrop between two strands of coloured metal.
+
+    The gap between the two wires of a hook, or between a wire and the next
+    scroll, is only a few pixels wide. It is tinted by the metal beside it, so
+    it never matches the backdrop closely enough for the hole passes, and the
+    texture window straddles the metal so it never looks flat. Left alone it
+    shows up as a pale outline around every wire. A strip qualifies when it is
+    long and thin (a stone is a compact blob), neutral, not brighter than the
+    backdrop, has no sparkle at its rim, and is framed by coloured metal.
+    """
+    cfg = ctx.cfg
+    if not cfg.get("remove_thin_gaps", True):
+        return 0
+    tol = float(cfg.get("thin_gap_tolerance", 38.0))
+    cand = (
+        (alpha >= 128)
+        & (ctx.color_dist < tol)
+        & (ctx.chroma_diff < float(cfg.get("thin_gap_chroma", 0.03)))
+        & (ctx.lum_diff <= float(cfg.get("thin_gap_max_brighter", 22.0)))
+        & (ctx.lum_diff >= -float(cfg.get("thin_gap_max_darker", 30.0)))
+    ).astype(np.uint8)
+    if not cand.any():
+        return 0
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=4)
+    if count <= 1:
+        return 0
+    dist = cv2.distanceTransform(cand, cv2.DIST_L2, 3)
+    thick = np.zeros(count, np.float32)
+    np.maximum.at(thick, labels.ravel(), dist.ravel())
+    areas = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+    stone_d = float(cfg["stone_size_ratio"]) * ctx.diag
+    min_area = max(12.0, 0.04 * 0.785 * stone_d * stone_d)
+    max_half = float(cfg.get("thin_gap_half_width_ratio", 0.0011)) * ctx.diag
+    elong = areas / np.maximum(np.pi * thick.astype(np.float64) ** 2, 1.0)
+    ok = (areas >= min_area) & (thick <= max_half) & (elong >= float(cfg.get("thin_gap_elongation", 3.0)))
+    ok[0] = False
+    ids = np.nonzero(ok)[0]
+    if ids.size == 0:
+        return 0
+    # no sparkle at the rim: a stone facet has a highlight right beside it
+    sparkle = (ctx.lum_diff > 30).astype(np.uint8)
+    sparkle_near = cv2.dilate(sparkle, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(np.float64)
+    spark_frac = np.bincount(labels.ravel(), weights=sparkle_near.ravel(), minlength=count) / np.maximum(areas, 1)
+    chosen = [int(i) for i in ids if spark_frac[i] < 0.05 and _bordered_by_coloured_metal(ctx, labels, stats, int(i), alpha, cfg)]
+    if not chosen:
+        return 0
+    clear = np.isin(labels, chosen).astype(np.uint8)
+    # take in the anti-aliased rim of the strip
+    rim = cv2.dilate(clear, np.ones((3, 3), np.uint8)).astype(bool)
+    rim &= (ctx.color_dist < tol * 1.3) & (ctx.chroma_diff < 0.035) & (ctx.lum_diff <= float(cfg.get("thin_gap_max_brighter", 22.0)))
+    clear = clear.astype(bool) | rim
+    before = int((alpha[clear] > 0).sum())
+    alpha[clear] = 0
+    ctx.thin_gap_mask = clear
+    return before
+
+
+def open_backdrop_hollows(ctx: MatteContext, alpha: np.ndarray) -> int:
+    """Clear openings that show plain backdrop, whatever frames them.
+
+    Openwork pendants and bead strands have many small windows framed by
+    pave or white gold. The model often fills them, and the other passes
+    need a coloured-metal frame or a large area. Here an opening qualifies
+    when it is neutral, flat and matches the local backdrop closely. Diamonds
+    that reflect the backdrop are protected: a stone always has dark facets
+    or a sparkle right next to its backdrop-coloured facets, so a candidate
+    with such pixels inside or at its rim is only cleared when it is clearly
+    larger than a stone.
+    """
+    cfg = ctx.cfg
+    if not cfg["open_backdrop_hollows"]:
+        return 0
+    neutral_flat = (ctx.chroma_diff < 0.03) & (ctx.lum_diff <= 6.0) & (ctx.lum_diff >= -10.0)
+    seed = (
+        (ctx.color_dist < float(cfg["hollow_seed_tolerance"]))
+        & (_local_std(ctx.gray, 3) < 3.5)
+        & neutral_flat
+        & (alpha > 0)
+    ).astype(np.uint8)
+    if not seed.any():
+        return 0
+    grow_ok = ((ctx.color_dist < float(cfg["hollow_grow_tolerance"]) * 1.25) & neutral_flat).astype(np.uint8)
+    region = seed.copy()
+    k3 = np.ones((3, 3), np.uint8)
+    for _ in range(4):
+        region = cv2.dilate(region, k3) & grow_ok
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=4)
+    if count <= 1:
+        return 0
+    flat = labels.ravel()
+    areas = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+    mean_dist = np.bincount(flat, weights=ctx.color_dist.ravel().astype(np.float64), minlength=count) / np.maximum(areas, 1)
+    seed_frac = np.bincount(flat, weights=seed.ravel().astype(np.float64), minlength=count) / np.maximum(areas, 1)
+    mean_alpha = np.bincount(flat, weights=alpha.ravel().astype(np.float64), minlength=count) / np.maximum(areas, 1)
+
+    stone_d = float(cfg["stone_size_ratio"]) * ctx.diag
+    stone_area = 0.785 * stone_d * stone_d
+    min_area = max(4.0, 0.02 * stone_area)
+    rim = max(2, int(round(stone_d * 0.12)))
+    # A diamond shows dark pavilion facets AND a sparkle close together; a
+    # black bead or dark metal shading has no sparkle, so it does not count.
+    k_rim = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rim + 1, 2 * rim + 1))
+    k_stone = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(stone_d) + 1, 2 * int(stone_d) + 1))
+    dark = ((ctx.lum_diff < -45) & (ctx.chroma_diff < 0.05)).astype(np.uint8)
+    sparkle = (ctx.lum_diff > 30).astype(np.uint8)
+    stone_zone = cv2.dilate(dark, k_stone) & cv2.dilate(sparkle, k_stone)
+    facet = ((dark | sparkle) & stone_zone).astype(np.uint8)
+    facet_near = cv2.dilate(facet, k_rim)
+    facet_frac = np.bincount(flat, weights=facet_near.ravel().astype(np.float64), minlength=count) / np.maximum(areas, 1)
+
+    chosen = []
+    for idx in range(1, count):
+        if mean_alpha[idx] < 8 or areas[idx] < min_area:
+            continue
+        big = areas[idx] >= 1.5 * stone_area
+        # Openings bigger than a stone cannot be a reflection in a stone, so a
+        # looser match is accepted (soft photos, strips between bead strands).
+        max_dist = float(cfg["hollow_max_mean_dist"]) * (1.5 if big else 1.0)
+        if mean_dist[idx] > max_dist or seed_frac[idx] < (0.12 if big else 0.35):
+            continue
+        if not big and facet_frac[idx] > 0.25:
+            continue        # backdrop reflected in a stone's facets
+        chosen.append(idx)
+    if not chosen:
+        return 0
+    clear = np.isin(labels, chosen)
+    # include the anti-aliased rim of each opening
+    clear = cv2.dilate(clear.astype(np.uint8), k3).astype(bool) & (ctx.color_dist < float(cfg["hollow_grow_tolerance"]) * 1.4) & (ctx.lum_diff <= 6.0) & (ctx.chroma_diff < 0.035)
+    before = int((alpha[clear] > 0).sum())
+    alpha[clear] = 0
+    return before
+
+
+def _exterior_colour(src: np.ndarray, before: np.ndarray) -> np.ndarray | None:
+    """Median colour of the backdrop around the product (clear in the model's matte)."""
+    clear = cv2.erode((before <= 2).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    if clear.sum() < 200:
+        return None
+    ys, xs = np.nonzero(clear)
+    step = max(1, len(ys) // 20000)
+    return np.median(src[ys[::step], xs[::step]].astype(np.float32), axis=0)
+
+
+def _open_backdrop_mask(ctx: MatteContext, before: np.ndarray) -> np.ndarray:
+    """Pixels of open backdrop seen through the piece: flat, and the same
+    colour as the backdrop around the product. A stone's facet reflection is
+    off-colour and has facet edges inside it, however broad it is, so it never
+    qualifies; the stone-reflection restore must not bring these back."""
+    cfg = ctx.cfg
+    empty = np.zeros(before.shape, bool)
+    ext = _exterior_colour(ctx.src, before)
+    if ext is None:
+        return empty
+    diff = cv2.subtract(ctx.src, ext.reshape(1, 1, 3).astype(np.float32))
+    dist = cv2.sqrt(cv2.transform(cv2.multiply(diff, diff), np.ones((1, 3), np.float32)))
+    m = ((dist < float(cfg.get("open_backdrop_max_dist", 26.0))) & (ctx.chroma_diff < 0.02) & (ctx.lum_diff <= float(cfg["hole_bright_tolerance"])) & (ctx.fine_texture < float(cfg.get("open_backdrop_max_fine", 3.0)))).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    if not m.any():
+        return empty
+    stone_d = float(cfg["stone_size_ratio"]) * ctx.diag
+    min_area = float(cfg.get("flat_region_min_stone_areas", 0.35)) * 0.785 * stone_d * stone_d
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=4)
+    big = np.nonzero(stats[:, cv2.CC_STAT_AREA] >= min_area)[0]
+    big = big[big > 0]
+    if big.size == 0:
+        return empty
+    return np.isin(labels, big)
+
+
+def restore_stone_reflections(ctx: MatteContext, before: np.ndarray, alpha: np.ndarray) -> int:
+    """Undo cuts that were really a diamond reflecting the backdrop.
+
+    Large brilliant-cut stones have broad facets that mirror the grey studio
+    backdrop, and the clean-up passes can mistake them for openings (holes
+    punched into solitaires). Measured on real photos, true openings match
+    the nearby backdrop almost exactly (median difference 2-7), while a facet
+    reflection is clearly off (10-35) and darker than the backdrop. Any region
+    the model was confident about, that a pass cut out, and that looks like
+    a reflection, is restored.
+    """
+    cfg = ctx.cfg
+    if not cfg["protect_stone_reflections"]:
+        return 0
+    open_mask = _open_backdrop_mask(ctx, before)
+    ctx.open_backdrop = open_mask
+    cut = ((before >= int(cfg["reflection_model_alpha"])) & (alpha <= 127) & ~open_mask).astype(np.uint8)
+    if not cut.any():
+        return 0
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(cut, connectivity=8)
+    restored = 0
+    stone_d = float(cfg["stone_size_ratio"]) * ctx.diag
+    stone_area = 0.785 * stone_d * stone_d
+    min_d = float(cfg["reflection_min_dist"])
+    max_lum = float(cfg["reflection_max_lum"])
+    for idx in range(1, count):
+        x, y, w, h = stats[idx, :4]
+        comp = labels[y:y + h, x:x + w] == idx
+        d_med = float(np.median(ctx.color_dist[y:y + h, x:x + w][comp]))
+        lum_med = float(np.median(ctx.lum_diff[y:y + h, x:x + w][comp]))
+        small = stats[idx, cv2.CC_STAT_AREA] < 0.5 * stone_area
+        if lum_med < max_lum and (d_med > min_d or (small and d_med > 0.6 * min_d)):
+            region = alpha[y:y + h, x:x + w]
+            region[comp] = before[y:y + h, x:x + w][comp]
+            restored += int(comp.sum())
+    return restored
 
 
 def remove_hierarchy_holes(ctx: MatteContext, alpha: np.ndarray) -> int:
@@ -538,6 +986,44 @@ def cluster_components(mask: np.ndarray, labels: np.ndarray, count: int, link_di
     return {idx: int(cluster_of[idx]) for idx in range(1, count)}, cluster_area
 
 
+def _backdrop_zone(ctx: MatteContext, alpha: np.ndarray) -> np.ndarray:
+    """Pixels that sit on, or right beside, a flat patch of plain backdrop.
+
+    A stone is faceted: even a bright flat facet is only a few pixels wide.
+    A gap between two wires, or the backdrop around the outline, is a large
+    flat area that matches the backdrop colour and hue. The rim of such an
+    area measures as "textured" (the measuring window straddles the metal),
+    which made earlier passes mistake the rim for a stone and give it back
+    as a pale outline. Anything within the window's reach of a sizeable flat
+    backdrop patch that is already clear stays clear.
+    """
+    cfg = ctx.cfg
+    bright = float(cfg["hole_bright_tolerance"])
+    flat = (
+        (ctx.color_dist < float(cfg.get("band_color_tolerance", 16.0)))
+        & (ctx.fine_texture < float(cfg.get("band_flat_texture", 3.5)))
+        & (ctx.chroma_diff < float(cfg.get("band_chroma_tolerance", 0.025)))
+        & (ctx.lum_diff <= bright)
+        & (alpha < 128)
+    )
+    flat = cv2.morphologyEx(flat.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    thin = getattr(ctx, "thin_gap_mask", None)
+    thin_zone = cv2.dilate(thin.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool) if thin is not None else None
+    if not flat.any():
+        return thin_zone if thin_zone is not None else np.zeros(alpha.shape, bool)
+    stone_r = float(cfg["stone_size_ratio"]) * ctx.diag / 2.0
+    min_area = float(cfg.get("band_min_area_ratio", 0.12)) * np.pi * stone_r * stone_r
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(flat, connectivity=4)
+    big = np.nonzero(stats[:, cv2.CC_STAT_AREA] >= min_area)[0]
+    big = big[big > 0]
+    if big.size == 0:
+        return thin_zone if thin_zone is not None else np.zeros(alpha.shape, bool)
+    core = np.isin(labels, big).astype(np.uint8)
+    reach = max(2, int(round(float(cfg.get("band_reach_ratio", 0.0012)) * ctx.diag)))
+    zone = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1, 2 * reach + 1))).astype(bool)
+    return zone | thin_zone if thin_zone is not None else zone
+
+
 def solidify_stones(ctx: MatteContext, alpha: np.ndarray) -> int:
     """Make stones and the inside of settings fully opaque.
 
@@ -557,6 +1043,10 @@ def solidify_stones(ctx: MatteContext, alpha: np.ndarray) -> int:
         return 0
     h, w = alpha.shape
     backdrop = ctx.backdrop_like
+    band = _backdrop_zone(ctx, alpha)
+    open_bd = getattr(ctx, "open_backdrop", None)
+    if open_bd is not None:
+        band = band | cv2.dilate(open_bd.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
     changed = 0
 
     # enclosed regions (holes in the solid matte)
@@ -580,9 +1070,13 @@ def solidify_stones(ctx: MatteContext, alpha: np.ndarray) -> int:
                 metal = (ctx.color_dist >= float(cfg["hole_grow_tolerance"])) & (
                     (ctx.chroma_diff >= 0.04) | (ctx.lum_diff < -45)
                     | (ctx.lum_diff > float(cfg["hole_bright_tolerance"]) * 2))
-                fill = np.isin(labels, fill_ids) & ~backdrop & (faceted | metal) & (alpha < 255)
+                fill = np.isin(labels, fill_ids) & ~backdrop & ~band & (faceted | metal) & (alpha < 255)
                 alpha[fill] = 255
                 changed += int(fill.sum())
+
+    edge = max(1, int(round(float(cfg["stone_edge_px_ratio"]) * ctx.diag)))
+    edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * edge + 1, 2 * edge + 1))
+    interior = cv2.erode((alpha >= 64).astype(np.uint8), edge_kernel).astype(bool)
 
     # stone-sized notches: a stone the model partly dropped at the edge of a
     # setting is not enclosed, but it sits inside the closed outline. Only
@@ -610,23 +1104,127 @@ def solidify_stones(ctx: MatteContext, alpha: np.ndarray) -> int:
         ctx.lum_diff, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rr + 1, 2 * rr + 1))
     ) > float(cfg.get("stone_sparkle_min", 15.0))
     stone_like = sparkle_near & ((ctx.texture >= tex_max * 1.3) | ((ctx.texture >= tex_max) & well_inside))
-    notch = closed & (alpha < 255) & stone_like & ~backdrop & (~backdrop_coloured | surrounded)
+    notch = closed & (alpha < 255) & stone_like & ~backdrop & ~band & (~backdrop_coloured | surrounded)
+    # A dropped stone leaves a compact, stone-sized notch. Thin slivers along
+    # an outline (closing a curved chain, sharpening halo) are not stones.
+    open_area = (closed & (alpha < 128)).astype(np.uint8)
+    if open_area.any():
+        n_open, lab_open = cv2.connectedComponents(open_area, connectivity=8)
+        thickness = cv2.distanceTransform(open_area, cv2.DIST_L2, 3)
+        max_thick = np.zeros(n_open, np.float32)
+        np.maximum.at(max_thick, lab_open.ravel(), thickness.ravel())
+        thick_ids = np.nonzero(max_thick >= 0.35 * r)[0]
+        thick_ids = thick_ids[thick_ids > 0]
+        compact = np.isin(lab_open, thick_ids) | interior
+        notch &= compact
+    else:
+        notch &= interior
     alpha[notch] = 255
     changed += int(notch.sum())
 
-    # semi-transparent interior pixels
-    edge = max(1, int(round(float(cfg["stone_edge_px_ratio"]) * ctx.diag)))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * edge + 1, 2 * edge + 1))
-    interior = cv2.erode((alpha >= 64).astype(np.uint8), kernel).astype(bool)
+    # semi-transparent interior pixels (soft outline left untouched)
     # clearly not backdrop: different colour AND different hue (shadow is not metal)
     # (shadows are only mildly darker; dark stone facets / metal are much darker)
     bright = float(cfg["hole_bright_tolerance"]) * 2
     metal_like = (ctx.color_dist >= float(cfg["hole_grow_tolerance"])) & (
         (ctx.chroma_diff >= 0.04) | (ctx.lum_diff < -45) | (ctx.lum_diff > bright))
-    raise_px = interior & (alpha < 255) & ~backdrop & (stone_like | metal_like) & (~backdrop_coloured | surrounded)
+    raise_px = interior & (alpha < 255) & ~backdrop & ~band & (stone_like | metal_like) & (~backdrop_coloured | surrounded)
     alpha[raise_px] = 255
     changed += int(raise_px.sum())
     return changed
+
+
+def clear_backdrop_haze(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict) -> int:
+    """Final pass: a semi-transparent pixel that is exactly backdrop colour is
+    haze, not product. A real edge pixel is a blend with the metal, so its
+    colour is off the backdrop. Works in strips (large photos)."""
+    if not cfg.get("clear_backdrop_haze", True):
+        return 0
+    tol = float(cfg.get("haze_color_tolerance", 20.0))
+    bright = float(cfg.get("haze_max_brighter", 8.0))
+    cleared = 0
+    step = 512
+    for y in range(0, alpha.shape[0], step):
+        sl = slice(y, min(alpha.shape[0], y + step))
+        a = alpha[sl]
+        cand = (a > 0) & (a < float(cfg.get("haze_max_alpha", 200)))
+        if not cand.any():
+            continue
+        s = src[sl].astype(np.float32)
+        b = bg[sl].astype(np.float32)
+        diff = s - b
+        dist = np.sqrt((diff * diff).sum(axis=2))
+        lum = diff.mean(axis=2)
+        s_n = s / (s.sum(axis=2, keepdims=True) + 1.0)
+        b_n = b / (b.sum(axis=2, keepdims=True) + 1.0)
+        chroma = np.abs(s_n - b_n).max(axis=2)
+        haze = cand & (dist < tol) & (chroma < float(cfg.get("haze_chroma", 0.03))) & (lum <= bright)
+        cleared += int(haze.sum())
+        a[haze] = 0
+    return cleared
+
+
+def clear_flat_backdrop(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict) -> int:
+    """Final pass: large, solid, neutral patches whose colour is the backdrop
+    (pale grey/white openings framed by metal) are cleared even when the model
+    left them opaque. Diamonds are speckled by facets, so a morphological open
+    removes them from the candidate mask; only solid blobs survive."""
+    if not cfg.get("clear_flat_backdrop", True):
+        return 0
+    H, W = alpha.shape
+    s = max(1, int(round(max(H, W) / float(cfg.get("flat_backdrop_ref_px", 3000)))))
+    if s > 1:
+        small = lambda x: cv2.resize(x, (W // s, H // s), interpolation=cv2.INTER_AREA)
+    else:
+        small = lambda x: x
+    S = small(src).astype(np.float32)
+    B = small(bg).astype(np.float32)
+    A = small(alpha)
+    diff = S - B
+    dist = np.sqrt((diff * diff).sum(axis=2))
+    s_n = S / (S.sum(axis=2, keepdims=True) + 1.0)
+    b_n = B / (B.sum(axis=2, keepdims=True) + 1.0)
+    chroma = np.abs(s_n - b_n).max(axis=2)
+    m = ((A > 0) & (dist < float(cfg.get("flat_backdrop_dist", 60.0)))
+         & (chroma < float(cfg.get("flat_backdrop_chroma", 0.04)))).astype(np.uint8)
+    k = int(cfg.get("flat_backdrop_open", 7))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    min_area = float(cfg.get("flat_backdrop_min_area", 120)) * (2.0 / s) ** 2 if s < 2 else float(cfg.get("flat_backdrop_min_area", 120))
+    keep_ids = np.flatnonzero(st[:, cv2.CC_STAT_AREA] >= min_area)
+    keep_ids = keep_ids[keep_ids > 0]
+    if keep_ids.size == 0:
+        return 0
+    # A real opening is framed by metal; a flat facet inside a diamond is
+    # framed by other (neutral) facets. Keep only blobs whose border is mostly
+    # warm metal.
+    warm = ((s_n[..., 0] - s_n[..., 2]) > float(cfg.get("flat_backdrop_warm", 0.06)))
+    need = float(cfg.get("flat_backdrop_metal_frac", 0.6))
+    ok = []
+    k3, k9 = np.ones((3, 3), np.uint8), np.ones((9, 9), np.uint8)
+    for i in keep_ids:
+        x, y, w, h = st[i, 0], st[i, 1], st[i, 2], st[i, 3]
+        y0, y1, x0, x1 = max(0, y - 6), min(m.shape[0], y + h + 6), max(0, x - 6), min(m.shape[1], x + w + 6)
+        sel = (lab[y0:y1, x0:x1] == i).astype(np.uint8)
+        ring = (cv2.dilate(sel, k9) > 0) & (cv2.dilate(sel, k3) == 0)
+        if not (ring.any() and float(warm[y0:y1, x0:x1][ring].mean()) >= need):
+            continue
+        core = cv2.erode(sel, k3, iterations=2) > 0
+        if core.sum() < 10:
+            core = sel > 0
+        # a true opening is the backdrop colour; a facet that merely looks pale is not
+        if float(dist[y0:y1, x0:x1][core].mean()) <= float(cfg.get("flat_backdrop_core_dist", 16.0)):
+            ok.append(i)
+    if not ok:
+        return 0
+    keep = np.isin(lab, np.array(ok)).astype(np.uint8)
+    keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    if s > 1:
+        keep = cv2.resize(keep, (W, H), interpolation=cv2.INTER_NEAREST)
+    sel = (keep > 0) & (alpha > 0)
+    cleared = int(sel.sum())
+    alpha[sel] = 0
+    return cleared
 
 
 def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None = None,
@@ -638,16 +1236,148 @@ def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None
     a crop around the product only, which is much faster on large photos.
     """
     cfg = _cfg(settings)
+    max_px = float(cfg.get("full_res_cleanup_max_px", 12_000_000))
+    h, w = alpha.shape
+    if h * w > max_px:
+        return _clean_matte_large(source_rgb, alpha, settings, cfg, background, reference_size, max_px)
     alpha = alpha.copy()
+    model_alpha = alpha.copy()
     ctx = MatteContext(source_rgb, alpha, cfg, background, reference_size)
     shadows = shadow_mask(ctx, alpha)
     stats = {
+        "edge_refined_px": refine_edges(ctx, alpha),
         "border_background_px": remove_border_background(ctx, alpha),
         "shadow_px": remove_shadows(ctx, alpha, shadows),
         "recovered_detail_px": recover_thin_details(ctx, alpha, shadows),
         "hole_px": remove_enclosed_background(ctx, alpha),
         "contour_hole_px": remove_hierarchy_holes(ctx, alpha),
+        "pocket_px": open_metal_pockets(ctx, alpha),
+        "hollow_px": open_backdrop_hollows(ctx, alpha),
+        "thin_gap_px": remove_thin_gaps(ctx, alpha),
         "speck_px": remove_specks(ctx, alpha),
     }
+    stats["restored_reflection_px"] = restore_stone_reflections(ctx, model_alpha, alpha)
     stats["solid_stone_px"] = solidify_stones(ctx, alpha)
+    stats["haze_px"] = clear_backdrop_haze(ctx.src, ctx.bg, alpha, cfg)
+    stats["flat_backdrop_px"] = clear_flat_backdrop(ctx.src, ctx.bg, alpha, cfg)
     return alpha, stats, ctx
+
+
+def _clean_matte_large(source_rgb, alpha, settings, cfg, background, reference_size, max_px):
+    """Clean-up for very large crops (e.g. a necklace filling a 30 MP photo).
+
+    Decisions (hollows, shadows, specks, pockets, stones) are made on a
+    reduced copy - those features are many pixels wide even there - and
+    transferred to the full-resolution matte; only edge refinement runs at
+    native resolution. Several times faster, same result where it matters.
+    """
+    h, w = alpha.shape
+    scale = min(1.0, (max_px / float(h * w)) ** 0.5)
+    sw, sh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    small_src = cv2.resize(source_rgb, (sw, sh), interpolation=cv2.INTER_AREA)
+    small_in = cv2.resize(alpha, (sw, sh), interpolation=cv2.INTER_AREA)
+    small_bg = None if background is None else cv2.resize(background, (sw, sh), interpolation=cv2.INTER_AREA)
+    ref_h, ref_w = reference_size or (h, w)
+    small_ref = (max(1, int(round(ref_h * scale))), max(1, int(round(ref_w * scale))))
+    small_cfg = dict(settings or {})
+    small_cfg["refine_edges"] = False          # done at native resolution below
+    # never take the large path again on the reduced copy (rounding can leave
+    # it a few pixels over the limit, which used to recurse until out of memory)
+    small_cfg["full_res_cleanup_max_px"] = float("inf")
+    small_out, stats, small_ctx = clean_matte(small_src, small_in, small_cfg, small_bg, small_ref)
+
+    # transfer the decisions
+    delta = small_out.astype(np.int16) - small_in.astype(np.int16)
+    cleared = cv2.resize((delta < -64).astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR) > 0
+    raised = cv2.resize((delta > 64).astype(np.uint8) * (small_out >= 250), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+    out = alpha.copy()
+    out[cleared] = 0
+    out[raised & ~cleared] = 255
+
+    bg_full = cv2.resize(small_ctx.bg, (w, h), interpolation=cv2.INTER_LINEAR)
+    restored_mask = None
+    if cfg["protect_stone_reflections"]:
+        open_small = getattr(small_ctx, "open_backdrop", None)
+        open_full = None
+        if open_small is not None and open_small.any():
+            open_full = cv2.resize(open_small.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        restored_mask = _restore_reflections_fullres(
+            source_rgb, bg_full, alpha, out, cfg, float(np.hypot(ref_h, ref_w)), open_full)
+        stats["restored_reflection_px"] = stats.get("restored_reflection_px", 0) + int(restored_mask.sum())
+        cleared &= ~restored_mask
+    if cfg["refine_edges"]:
+        stats["edge_refined_px"] = refine_edges_core(source_rgb, out, bg_full, cfg, float(np.hypot(ref_h, ref_w)))
+    # keep cleared regions clear after edge refinement
+    out[cleared & (out < 128)] = 0
+    if restored_mask is not None and restored_mask.any():
+        # stone facets: edge refinement must not thin them out again
+        out[restored_mask] = np.maximum(out[restored_mask], alpha[restored_mask])
+
+    stats["haze_px"] = clear_backdrop_haze(source_rgb, bg_full, out, cfg)
+    stats["flat_backdrop_px"] = clear_flat_backdrop(source_rgb, bg_full, out, cfg)
+
+    class _FullCtx:
+        """What callers use from the context, at full resolution."""
+    ctx = _FullCtx()
+    ctx.bg = bg_full
+    ctx.gray = cv2.cvtColor(source_rgb.astype(np.float32), cv2.COLOR_RGB2GRAY)
+    ctx.diag = float(np.hypot(ref_h, ref_w))
+    stats["reduced_scale"] = round(scale, 3)
+    return out, stats, ctx
+
+
+def _stone_zone(src, bg, stone_d):
+    """Pixels within a stone's diameter of both dark facets and a sparkle."""
+    diff = src.astype(np.float32) - bg
+    lum = diff.mean(axis=2)
+    tot = src.astype(np.float32).sum(axis=2) + 1
+    btot = bg.sum(axis=2) + 1
+    chroma = np.abs(src / tot[..., None] - bg / btot[..., None]).max(axis=2)
+    dark = ((lum < -45) & (chroma < 0.05)).astype(np.uint8)
+    sparkle = (lum > 30).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(stone_d) + 1, 2 * int(stone_d) + 1))
+    return (cv2.dilate(dark, k) & cv2.dilate(sparkle, k)).astype(bool)
+
+
+def _restore_reflections_fullres(src, bg, before, out, cfg, diag, open_mask=None) -> int:
+    """restore_stone_reflections for the large-photo path, at full
+    resolution, computing colour statistics only inside each cut region."""
+    restored_mask = np.zeros(out.shape, bool)
+    stone_d = float(cfg["stone_size_ratio"]) * diag
+    low = int(cfg.get("reflection_low_alpha", 90))
+    cut = (before >= low) & (out <= 127)
+    if open_mask is not None:
+        cut &= ~open_mask
+    cut = cut.astype(np.uint8)
+    if not cut.any():
+        return restored_mask
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(cut, connectivity=8)
+    conf = before >= int(cfg["reflection_model_alpha"])
+    stone_area = 0.785 * stone_d * stone_d
+    min_d = float(cfg["reflection_min_dist"])
+    max_lum = float(cfg["reflection_max_lum"])
+    restored = 0
+    for idx in range(1, count):
+        area = stats[idx, cv2.CC_STAT_AREA]
+        if area < 6:
+            continue
+        x, y, w, h = stats[idx, :4]
+        comp = labels[y:y + h, x:x + w] == idx
+        diff = src[y:y + h, x:x + w][comp].astype(np.float32) - bg[y:y + h, x:x + w][comp]
+        d_med = float(np.median(np.sqrt((diff * diff).sum(axis=1))))
+        lum_med = float(np.median(diff.mean(axis=1)))
+        small = area < 0.5 * stone_area
+        if lum_med < max_lum and (d_med > min_d or (small and d_med > 0.6 * min_d)):
+            if conf[y:y + h, x:x + w][comp].mean() < 0.5:
+                # model was unsure: only inside a stone (dark facets + sparkle)
+                pad = int(stone_d) + 2
+                Y0, Y1 = max(0, y - pad), min(out.shape[0], y + h + pad)
+                X0, X1 = max(0, x - pad), min(out.shape[1], x + w + pad)
+                zone = _stone_zone(src[Y0:Y1, X0:X1], bg[Y0:Y1, X0:X1], stone_d)
+                if zone[y - Y0:y - Y0 + h, x - X0:x - X0 + w][comp].mean() < 0.6:
+                    continue
+            region = out[y:y + h, x:x + w]
+            # restore to at least a solid level: these are stone facets
+            region[comp] = np.maximum(before[y:y + h, x:x + w][comp], 200)
+            restored_mask[y:y + h, x:x + w] |= comp
+    return restored_mask

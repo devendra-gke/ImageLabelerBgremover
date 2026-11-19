@@ -192,3 +192,30 @@ class DiamondShineTests(TestCase):
         cleaned, stats, _ = hole_cleanup.clean_matte(np.asarray(photo), alpha, {})
         self.assertGreater((cleaned[stone] >= 250).mean(), 0.97, stats)
         self.assertLess((cleaned[gap] > 0).mean(), 0.2, stats)
+
+
+class OpenworkHollowTests(TestCase):
+    """A backdrop hollow inside a white-gold / pave frame (neutral, no
+    coloured metal) that the model filled in must still be cleared."""
+
+    def test_white_gold_frame_hollow_is_cleared(self):
+        from processor.services import hole_cleanup
+
+        rng = np.random.default_rng(3)
+        h, w = 500, 700
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        img = np.zeros((h, w, 3), np.float32)
+        img[:] = (211, 210, 215)                                      # light grey backdrop
+        img += rng.normal(0, 1.0, img.shape)                          # sensor noise
+        d = np.hypot((xx - 350) / 1.3, yy - 250)
+        frame = (d <= 150) & (d >= 110)                                # pave frame
+        hollow = d < 104
+        pave = 200 + 45 * np.sign(np.sin(xx / 3) * np.sin(yy / 3)) + rng.normal(0, 10, (h, w))
+        img[frame] = np.stack([pave, pave, pave + 4], -1)[frame]        # neutral, sparkly
+        alpha = np.zeros((h, w), np.uint8)
+        alpha[d <= 150] = 255                                           # model filled the hollow
+        photo = np.clip(img, 0, 255).astype(np.uint8)
+        cleaned, stats, _ = hole_cleanup.clean_matte(photo, alpha, {})
+        self.assertLess((cleaned[hollow] > 0).mean(), 0.05, stats)
+        inner_frame = frame & (d >= 113) & (d <= 147)
+        self.assertGreater((cleaned[inner_frame] >= 250).mean(), 0.95, stats)

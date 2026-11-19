@@ -66,6 +66,17 @@ Every photo now goes through these steps (`processor/services/jewellery_detectio
      settings are recognised as smooth, backdrop-coloured and framed by
      coloured metal, and cleared. Settings: `solidify_stones`,
      `backdrop_texture_max`, `stone_sparkle_min`, `gap_border_min_saturation`.
+   * **edges are refined at full resolution** – the model's matte is computed
+     at ~1024 px; a guided filter re-fits it to the real photo edges, the
+     camera's sharpening halo is ignored, and backdrop colour is removed from
+     soft edge pixels (no light/grey outline on dark pages). Settings:
+     `refine_edges`, `edge_radius_ratio`, `edge_contrast`, `decontaminate_edges`.
+   * the backdrop is estimated **locally** (lighting varies across a photo), so
+     openwork hollows framed by white gold / pavé are cleared too, and small
+     backdrop pockets inside gold chains are opened (`open_metal_pockets`).
+   * very large crops (a necklace filling a 30 MP photo) are cleaned on a
+     reduced copy and in strips, so they stay fast and within memory
+     (`full_res_cleanup_max_px`).
 4. **Validate** – warnings when the product touches the photo edge, looks
    blurry, or nothing is detected (such photos are skipped).
 
@@ -153,3 +164,18 @@ All 3D code runs in the browser (three.js is bundled in
 ```bash
 python manage.py test processor
 ```
+
+## v2.5 - white outline and leftover backdrop
+* Backdrop that sits right beside a wire or around the outline is no longer given back as a pale outline (`solidify_stones` now leaves anything that borders a flat patch of backdrop).
+* New `remove_thin_gaps` pass clears narrow backdrop strips between two strands of coloured metal (hooks, double wires, scroll gaps).
+* The stone-reflection restore no longer brings back flat patches that match the exterior backdrop colour.
+
+## v2.6 - leftover backdrop haze
+- New final pass `clear_backdrop_haze`: semi-transparent pixels whose colour matches the local backdrop (neutral, not brighter) are made fully transparent, so no white/grey film or blur remains inside medallions and openwork.
+- Open backdrop areas inside medallions are detected more reliably and are no longer re-filled by the stone/reflection restore steps.
+- Tunables in DEFAULTS: `haze_color_tolerance`, `haze_chroma`, `haze_max_brighter`, `haze_max_alpha`, `clear_backdrop_haze`.
+
+## v2.7 - solid backdrop patches left opaque
+- New final pass `clear_flat_backdrop`: solid pale/grey blobs inside medallions and openwork that the model left opaque are cleared. A blob is cleared only if (a) it survives a morphological open (so faceted diamonds do not qualify), (b) it is mostly bordered by warm metal, and (c) its colour matches the backdrop. This keeps large diamond facets safe.
+- Tunables: `flat_backdrop_dist`, `flat_backdrop_chroma`, `flat_backdrop_open`, `flat_backdrop_min_area`, `flat_backdrop_metal_frac`, `flat_backdrop_core_dist`, `clear_flat_backdrop`.
+- Note: for white-gold/silver pieces the metal-border test will not match, so the pass stays off rather than risk stones.
