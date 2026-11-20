@@ -179,3 +179,23 @@ python manage.py test processor
 - New final pass `clear_flat_backdrop`: solid pale/grey blobs inside medallions and openwork that the model left opaque are cleared. A blob is cleared only if (a) it survives a morphological open (so faceted diamonds do not qualify), (b) it is mostly bordered by warm metal, and (c) its colour matches the backdrop. This keeps large diamond facets safe.
 - Tunables: `flat_backdrop_dist`, `flat_backdrop_chroma`, `flat_backdrop_open`, `flat_backdrop_min_area`, `flat_backdrop_metal_frac`, `flat_backdrop_core_dist`, `clear_flat_backdrop`.
 - Note: for white-gold/silver pieces the metal-border test will not match, so the pass stays off rather than risk stones.
+
+## v2.7.1 - new UI
+- Warm editorial theme (cream paper, burnt-orange accent, gold highlights; Fraunces / IBM Plex Mono / Manrope fonts).
+- Effects: cursor-following glow, floating gem outlines, scroll-reveal cards, hard-shadow lift on cards and buttons, shimmer on the title, shine sweep on the main button, striped progress bar, drag-over highlight on drop zones, animated modal. Honours `prefers-reduced-motion`.
+- Template only: no element IDs or JS hooks changed, so processing and the 3D viewer behave as before.
+
+## v2.7.2 - Gurukrupa pink theme
+- Palette switched to pink: blush paper background, Gurukrupa pink accent (`#d6336c`), deep plum ink, rose-gold highlight. Change `--accent`, `--paper`, `--ink` in the `:root` block of `image_upload.html` to retheme.
+
+## v2.7.3 - Mission 3X logo, lighter pink
+- Gurukrupa | Mission 3X logo added to the top bar and the header (`processor/static/img/gk-3x-logo.png`).
+- Palette lightened: pale blush background, softer pink accent (`--accent: #e8629a`).
+
+## v2.8 - smoother edges, tiny edges and holes
+New final pass `finish_edges` (runs after every other clean-up, in strips so 30 MP crops stay light):
+- **Smooth contour**: the matte edge is blurred and re-sharpened around 50 % so stair-steps and wobble disappear but the edge stays crisp. Thin wires keep their width.
+- **Defringe**: partly-transparent edge pixels that are exactly the backdrop colour (neutral, not brighter) are dropped, so no leftover coloured outline.
+- **Tiny holes**: small enclosed openings (links, bead holes, filigree dots) are cleared when they are flat backdrop colour, framed by metal, and the model itself was unsure there.
+- **Diamond shine protected**: stone clusters, sparkle neighbourhoods and anything brighter than the backdrop are never touched.
+- Tunables in DEFAULTS: `finish_edges`, `smooth_gain`, `smooth_sigma_ratio`, `defringe_*`, `tiny_hole_*`, `finish_zone_*`.

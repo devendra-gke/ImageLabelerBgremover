@@ -78,6 +78,23 @@ DEFAULTS = {
     "flat_region_min_stone_areas": 0.35,  # open backdrop patch: min area (in stone areas)
     "open_backdrop_max_fine": 3.0,        # a patch this flat and ...
     "open_backdrop_max_dist": 26.0,        # ... this close to the exterior backdrop is not a stone reflection
+    "finish_edges": True,                 # final: smooth contour, defringe, clear tiny holes
+    "smooth_edges": True,
+    "smooth_sigma_ratio": 0.00018,
+    "smooth_gain": 2.4,
+    "finish_band_px": 2,
+    "defringe": True,
+    "defringe_d0": 9.0,
+    "defringe_d1": 30.0,
+    "defringe_chroma": 0.04,
+    "defringe_max_brighter": 4.0,
+    "defringe_max_alpha": 0.97,
+    "tiny_hole_model_max": 0.88,
+    "tiny_holes": True,
+    "tiny_hole_dist": 26.0,
+    "tiny_hole_chroma": 0.035,
+    "tiny_hole_max_px": 400,
+    "tiny_hole_metal_frac": 0.85,
     "clear_flat_backdrop": True,          # final: solid pale backdrop blobs left opaque become clear
     "flat_backdrop_dist": 60.0,
     "flat_backdrop_chroma": 0.04,
@@ -1227,6 +1244,128 @@ def clear_flat_backdrop(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg:
     return cleared
 
 
+def _finish_strip(src, bg, alpha, cfg, sigma, protect_rows, ref=None):
+    """One strip of finish_edges. Returns the new alpha (uint8) for the strip."""
+    a = alpha.astype(np.float32) / 255.0
+    solid = (a >= 0.5).astype(np.uint8)
+    k3 = np.ones((3, 3), np.uint8)
+    band_w = int(cfg.get("finish_band_px", 3))
+    kb = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_w + 1, 2 * band_w + 1))
+    contour = cv2.morphologyEx(solid, cv2.MORPH_GRADIENT, k3).astype(bool)
+    edge = contour | ((a > 0.01) & (a < 0.99))
+    band = cv2.dilate(edge.astype(np.uint8), kb) > 0
+
+    S = src.astype(np.float32)
+    B = bg.astype(np.float32)
+    diff = S - B
+    d = np.sqrt((diff * diff).sum(axis=2))
+    lum = diff.mean(axis=2)
+    # Stone clusters / texture: lots of contour in a small window, or sparkle
+    # right next to it. Facets and diamond shine are left exactly as they are.
+    zr = int(cfg.get("finish_zone_px", 21))
+    density = cv2.boxFilter(contour.astype(np.float32), -1, (zr, zr))
+    spark = cv2.dilate((lum > float(cfg.get("finish_sparkle", 18.0))).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    stone = (density > float(cfg.get("finish_zone_density", 0.16))) | spark
+    stone = cv2.dilate(stone.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    band &= ~stone
+    s_n = S / (S.sum(axis=2, keepdims=True) + 1.0)
+    b_n = B / (B.sum(axis=2, keepdims=True) + 1.0)
+    chroma = np.abs(s_n - b_n).max(axis=2)
+
+    out = a.copy()
+    # 1. smooth the contour: blur, then re-sharpen around 50 % so the edge is
+    #    anti-aliased and free of stair-steps but not soft. Only the band moves.
+    if cfg.get("smooth_edges", True):
+        bl = cv2.GaussianBlur(a, (0, 0), sigma)
+        q = np.clip((bl - 0.5) * float(cfg.get("smooth_gain", 2.4)) + 0.5, 0.0, 1.0)
+        # thin wires and small gaps keep their width: never smooth below the
+        # original where the feature is narrow (blurred peak < 0.9)
+        thin = (bl < 0.9) & (a > 0.9)
+        q = np.where(thin, np.maximum(q, a * 0.92), q)
+        out = np.where(band, q, out)
+
+    # 2. remove backdrop-coloured fringe on the edge. A genuine edge pixel is a
+    #    blend with the metal/stone, so its colour is clearly off the backdrop.
+    #    Pixels that are brighter than the backdrop (diamond shine, sparkle)
+    #    or coloured are never touched.
+    if cfg.get("defringe", True):
+        d0, d1 = float(cfg.get("defringe_d0", 9.0)), float(cfg.get("defringe_d1", 30.0))
+        cap = np.clip((d - d0) / max(1e-3, d1 - d0), 0.0, 1.0)
+        bgish = (band & (out < float(cfg.get("defringe_max_alpha", 0.97)))
+                 & (chroma < float(cfg.get("defringe_chroma", 0.04))) & (lum <= float(cfg.get("defringe_max_brighter", 4.0))))
+        out = np.where(bgish, np.minimum(out, np.maximum(cap, 0.0)), out)
+
+    # 3. tiny enclosed holes (gaps between links, bead holes, filigree dots)
+    if cfg.get("tiny_holes", True):
+        dh = float(cfg.get("tiny_hole_dist", 26.0))
+        m = ((out > 0.5) & (d < dh) & (chroma < float(cfg.get("tiny_hole_chroma", 0.035))) & (lum <= 4.0)).astype(np.uint8)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        if n > 1:
+            warm = (s_n[..., 0] - s_n[..., 2]) > float(cfg.get("flat_backdrop_warm", 0.06))
+            hmax = float(cfg.get("tiny_hole_max_px", 400))
+            H, W = m.shape
+            for i in range(1, n):
+                area = st[i, cv2.CC_STAT_AREA]
+                if area < int(cfg.get("tiny_hole_min_px", 10)) or area > hmax:
+                    continue
+                x, y, w, h = st[i, 0], st[i, 1], st[i, 2], st[i, 3]
+                if y <= protect_rows[0] or y + h >= protect_rows[1]:
+                    continue
+                y0, y1, x0, x1 = max(0, y - 4), min(H, y + h + 4), max(0, x - 4), min(W, x + w + 4)
+                sel = (lab[y0:y1, x0:x1] == i).astype(np.uint8)
+                ring = (cv2.dilate(sel, np.ones((7, 7), np.uint8)) > 0) & (cv2.dilate(sel, k3) == 0)
+                if not ring.any():
+                    continue
+                # framed by metal on most of its border, not by facets ...
+                if float(warm[y0:y1, x0:x1][ring].mean()) < float(cfg.get("tiny_hole_metal_frac", 0.6)):
+                    continue
+                inside = sel > 0
+                if stone[y0:y1, x0:x1][inside].any():
+                    continue
+                # ... flat inside (a facet has shading), the same colour as the
+                # backdrop, and with no sparkle next to it (diamond shine)
+                if float(lum[y0:y1, x0:x1][inside].std()) > float(cfg.get("tiny_hole_max_std", 3.0)):
+                    continue
+                if float(d[y0:y1, x0:x1][inside].mean()) > float(cfg.get("tiny_hole_core_dist", 14.0)):
+                    continue
+                # the model itself was unsure here (a flat plate of pale metal
+                # is solid in the model matte, a real opening is not)
+                if ref is not None and float((ref[y0:y1, x0:x1][inside].astype(np.float32) / 255.0).mean()) > float(cfg.get("tiny_hole_model_max", 0.88)):
+                    continue
+                near = cv2.dilate(sel, np.ones((11, 11), np.uint8)) > 0
+                if float((lum[y0:y1, x0:x1][near] > float(cfg.get("tiny_hole_sparkle", 18.0))).mean()) > 0.02:
+                    continue
+                out[y0:y1, x0:x1][cv2.dilate(sel, k3) > 0] = 0.0
+    return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
+
+
+def finish_edges(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict, diag: float, model_alpha=None) -> int:
+    """Last step: smooth the contour, drop backdrop-coloured fringe and clear
+    tiny enclosed holes, in strips so 30 MP crops stay light on memory."""
+    if not cfg.get("finish_edges", True):
+        return 0
+    H, W = alpha.shape
+    sigma = float(np.clip(float(cfg.get("smooth_sigma_ratio", 0.00018)) * diag, 0.7, 1.6))
+    overlap = 48
+    strip = 1024
+    changed = 0
+    for sy in range(0, H, strip):
+        ey = min(H, sy + strip)
+        py0, py1 = max(0, sy - overlap), min(H, ey + overlap)
+        part = alpha[py0:py1]
+        if not ((part > 0) & (part < 255)).any() and not part.any():
+            continue
+        new = _finish_strip(src[py0:py1], bg[py0:py1], part, cfg, sigma,
+                            (overlap if py0 > 0 else -1, (py1 - py0) - overlap if py1 < H else (py1 - py0) + 1),
+                            None if model_alpha is None else model_alpha[py0:py1])
+        a_old = alpha[sy:ey]
+        a_new = new[sy - py0:ey - py0]
+        changed += int((a_old != a_new).sum())
+        alpha[sy:ey] = a_new
+    return changed
+
+
 def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None = None,
                 background: np.ndarray | None = None, reference_size: tuple | None = None):
     """Run every clean-up pass. Returns (alpha, stats, context).
@@ -1260,6 +1399,7 @@ def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None
     stats["solid_stone_px"] = solidify_stones(ctx, alpha)
     stats["haze_px"] = clear_backdrop_haze(ctx.src, ctx.bg, alpha, cfg)
     stats["flat_backdrop_px"] = clear_flat_backdrop(ctx.src, ctx.bg, alpha, cfg)
+    stats["finished_edge_px"] = finish_edges(ctx.src, ctx.bg, alpha, cfg, ctx.diag, model_alpha)
     return alpha, stats, ctx
 
 
@@ -1315,6 +1455,7 @@ def _clean_matte_large(source_rgb, alpha, settings, cfg, background, reference_s
 
     stats["haze_px"] = clear_backdrop_haze(source_rgb, bg_full, out, cfg)
     stats["flat_backdrop_px"] = clear_flat_backdrop(source_rgb, bg_full, out, cfg)
+    stats["finished_edge_px"] = finish_edges(source_rgb, bg_full, out, cfg, float(np.hypot(ref_h, ref_w)), alpha)
 
     class _FullCtx:
         """What callers use from the context, at full resolution."""
