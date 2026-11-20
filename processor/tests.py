@@ -37,7 +37,7 @@ class JewelryBackgroundRemovalTests(TestCase):
         mapping, category_map, _ = read_excel_mapping(buffer)
 
         self.assertIn("1001", mapping)
-        self.assertEqual(mapping["1001"], ["SB-202", "1001", "0.90", "0.10", "12.50", "1.20"])
+        self.assertEqual(mapping["1001"], ["SB-202", "Di.Wt: 0.90", "Chain Wt: 0.10", "Gr Wt: 12.50"])
         self.assertEqual(category_map["1001"], "RING")
 
 

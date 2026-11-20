@@ -78,6 +78,19 @@ DEFAULTS = {
     "flat_region_min_stone_areas": 0.35,  # open backdrop patch: min area (in stone areas)
     "open_backdrop_max_fine": 3.0,        # a patch this flat and ...
     "open_backdrop_max_dist": 26.0,        # ... this close to the exterior backdrop is not a stone reflection
+    "clear_wedges": True,                 # openings between spokes/wires that are pure backdrop colour
+    "wedge_dist": 24.0,
+    "wedge_chroma": 0.03,
+    "wedge_open": 5,
+    "wedge_min_px": 40,
+    "wedge_max_px": 9000,
+    "wedge_core_dist": 9.0,
+    "wedge_max_std": 4.0,
+    "wedge_sparkle": 22.0,
+    "wedge_metal_frac": 0.12,
+    "wedge_bare_min_px": 100,
+    "wedge_bare_dist": 6.5,
+    "wedge_bare_std": 3.4,
     "finish_edges": True,                 # final: smooth contour, defringe, clear tiny holes
     "smooth_edges": True,
     "smooth_sigma_ratio": 0.00018,
@@ -1366,6 +1379,84 @@ def finish_edges(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict, 
     return changed
 
 
+def clear_backdrop_wedges(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict, model_alpha=None) -> int:
+    """Native-resolution pass for small openings between spokes, wires and
+    stone rows that the model left as pale backdrop. A patch is cleared only
+    if its colour IS the backdrop (tiny distance, flat, neutral), it has no
+    sparkle inside, and it touches metal. Works in strips."""
+    if not cfg.get("clear_wedges", True):
+        return 0
+    H, W = alpha.shape
+    ys = np.flatnonzero((alpha > 0).any(axis=1))
+    if ys.size == 0:
+        return 0
+    k3 = np.ones((3, 3), np.uint8)
+    kopen = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(cfg.get("wedge_open", 5)),) * 2)
+    amin, amax = int(cfg.get("wedge_min_px", 90)), int(cfg.get("wedge_max_px", 9000))
+    overlap, strip = 96, 1024
+    cleared = 0
+    for sy in range(int(ys[0]), int(ys[-1]) + 1, strip):
+        ey = min(H, sy + strip)
+        py0, py1 = max(0, sy - overlap), min(H, ey + overlap)
+        a = alpha[py0:py1]
+        if not (a > 0).any():
+            continue
+        S = src[py0:py1].astype(np.float32)
+        B = bg[py0:py1].astype(np.float32)
+        diff = S - B
+        d = np.sqrt((diff * diff).sum(axis=2))
+        lum = diff.mean(axis=2)
+        s_n = S / (S.sum(axis=2, keepdims=True) + 1.0)
+        b_n = B / (B.sum(axis=2, keepdims=True) + 1.0)
+        chroma = np.abs(s_n - b_n).max(axis=2)
+        m = ((a > 0) & (d < float(cfg.get("wedge_dist", 24.0))) & (chroma < float(cfg.get("wedge_chroma", 0.03)))
+             & (lum <= 6.0)).astype(np.uint8)
+        if not m.any():
+            continue
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kopen)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        if n <= 1:
+            continue
+        warm = (s_n[..., 0] - s_n[..., 2]) > float(cfg.get("flat_backdrop_warm", 0.06))
+        h_, w_ = m.shape
+        top_ok = overlap if py0 > 0 else -1
+        bot_ok = (py1 - py0) - overlap if py1 < H else (py1 - py0) + 1
+        for i in range(1, n):
+            area = st[i, cv2.CC_STAT_AREA]
+            if area < amin or area > amax:
+                continue
+            x, y, w, h = st[i, 0], st[i, 1], st[i, 2], st[i, 3]
+            if y <= top_ok or y + h >= bot_ok:
+                continue
+            y0, y1, x0, x1 = max(0, y - 5), min(h_, y + h + 5), max(0, x - 5), min(w_, x + w + 5)
+            sel = (lab[y0:y1, x0:x1] == i).astype(np.uint8)
+            inside = sel > 0
+            if float(d[y0:y1, x0:x1][inside].mean()) > float(cfg.get("wedge_core_dist", 9.0)):
+                continue
+            if float(lum[y0:y1, x0:x1][inside].std()) > float(cfg.get("wedge_max_std", 4.0)):
+                continue
+            if float(lum[y0:y1, x0:x1][inside].max()) > float(cfg.get("wedge_sparkle", 22.0)):
+                continue
+            ring = (cv2.dilate(sel, np.ones((9, 9), np.uint8)) > 0) & (cv2.dilate(sel, k3) == 0)
+            if not ring.any():
+                continue
+            wf = float(warm[y0:y1, x0:x1][ring].mean())
+            core_d = float(d[y0:y1, x0:x1][inside].mean())
+            sd = float(lum[y0:y1, x0:x1][inside].std())
+            if wf >= float(cfg.get("wedge_metal_frac", 0.12)) and (area >= 90 or wf >= 0.25):
+                pass                                      # touches metal: normal rule above
+            elif (area >= int(cfg.get("wedge_bare_min_px", 100)) and core_d <= float(cfg.get("wedge_bare_dist", 6.5))
+                  and sd <= float(cfg.get("wedge_bare_std", 3.4))):
+                pass                                      # framed by stones only, but exactly backdrop-flat
+            else:
+                continue
+            grow = cv2.dilate(sel, k3) > 0
+            sub = alpha[py0 + y0:py0 + y1, x0:x1]
+            cleared += int((sub[grow] > 0).sum())
+            sub[grow] = 0
+    return cleared
+
+
 def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None = None,
                 background: np.ndarray | None = None, reference_size: tuple | None = None):
     """Run every clean-up pass. Returns (alpha, stats, context).
@@ -1399,6 +1490,7 @@ def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None
     stats["solid_stone_px"] = solidify_stones(ctx, alpha)
     stats["haze_px"] = clear_backdrop_haze(ctx.src, ctx.bg, alpha, cfg)
     stats["flat_backdrop_px"] = clear_flat_backdrop(ctx.src, ctx.bg, alpha, cfg)
+    stats["wedge_px"] = clear_backdrop_wedges(ctx.src, ctx.bg, alpha, cfg)
     stats["finished_edge_px"] = finish_edges(ctx.src, ctx.bg, alpha, cfg, ctx.diag, model_alpha)
     return alpha, stats, ctx
 
@@ -1455,6 +1547,7 @@ def _clean_matte_large(source_rgb, alpha, settings, cfg, background, reference_s
 
     stats["haze_px"] = clear_backdrop_haze(source_rgb, bg_full, out, cfg)
     stats["flat_backdrop_px"] = clear_flat_backdrop(source_rgb, bg_full, out, cfg)
+    stats["wedge_px"] = clear_backdrop_wedges(source_rgb, bg_full, out, cfg)
     stats["finished_edge_px"] = finish_edges(source_rgb, bg_full, out, cfg, float(np.hypot(ref_h, ref_w)), alpha)
 
     class _FullCtx:

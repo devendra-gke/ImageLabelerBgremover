@@ -199,3 +199,7 @@ New final pass `finish_edges` (runs after every other clean-up, in strips so 30 
 - **Tiny holes**: small enclosed openings (links, bead holes, filigree dots) are cleared when they are flat backdrop colour, framed by metal, and the model itself was unsure there.
 - **Diamond shine protected**: stone clusters, sparkle neighbourhoods and anything brighter than the backdrop are never touched.
 - Tunables in DEFAULTS: `finish_edges`, `smooth_gain`, `smooth_sigma_ratio`, `defringe_*`, `tiny_hole_*`, `finish_zone_*`.
+
+## v2.9 - openings between spokes and stone rows
+- New `clear_backdrop_wedges` pass (native resolution): small openings between spokes, wires and stone rows that are exactly the backdrop colour (tiny colour distance, flat, neutral, no sparkle inside, touching metal or stones) are cleared. Diamond facets and shine are not touched.
+- Tunables: `wedge_*` in DEFAULTS; `clear_wedges: False` turns it off.

@@ -854,6 +854,40 @@ def read_excel_mapping_cached(excel_file):
     return cached
 
 
+# Catalogue text, in the order it is printed on the image:
+# StyleBio, then Dia Wt, then Chain Wt, then Gross Wt.
+CATALOG_TEXT_FIELDS = [
+    (("StyleBio", "Style Bio"), ""),
+    (("DiaWt", "Dia Wt", "Di.Wt"), "Di.Wt: "),
+    (("ChainWt", "Chain Wt"), "Chain Wt: "),
+    (("GrossWt", "Gross Wt", "Gr Wt"), "Gr Wt: "),
+]
+
+
+def _cell_text(series, i):
+    if series is None:
+        return ""
+    val = series.iloc[i]
+    if pd.isna(val):
+        return ""
+    text = str(val).strip()
+    return "" if text.lower() == "nan" else text
+
+
+def catalog_text_lines(row_values):
+    """Build the label lines from (prefix, value) pairs, skipping blanks."""
+    lines = []
+    for prefix, text in row_values:
+        if not text:
+            continue
+        # Jewlex exports already say "Di.Wt: 31 / 0.90 Ct"; a bare number
+        # from another sheet gets the label added.
+        if prefix and ":" not in text:
+            text = prefix + text
+        lines.append(text)
+    return lines
+
+
 def read_excel_mapping(excel_file):
     df = pd.read_excel(excel_file, engine="openpyxl", dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
@@ -868,61 +902,59 @@ def read_excel_mapping(excel_file):
     )
     category_series = get_named_series(df, "Category", "CATEGORY")
     style_series = get_named_series(df, "StyleBio", "Style Bio", "STYLEBIO")
-
-    text_field_names = [
-        "StyleBio",
-        "TagNo",
-        "DiaWt",
-        "ChainWt",
-        "ChainWT",
-        "GrossWt",
-        "StoneWt",
+    text_columns = [
+        (prefix, get_named_series(df, *names)) for names, prefix in CATALOG_TEXT_FIELDS
     ]
-    text_columns = []
-    seen_headers = set()
-    for name in text_field_names:
-        header = normalize_excel_header(name)
-        if header in seen_headers:
-            continue
-        series = get_named_series(df, name)
-        if series is not None:
-            seen_headers.add(header)
-            text_columns.append(series)
 
     mapping = {}
     category_map = {}
     style_map = {}
 
     for i in range(len(df)):
-        key = key_series.iloc[i] if key_series is not None else None
-
-        if pd.isna(key):
+        tag = _cell_text(key_series, i)
+        style_full = _cell_text(style_series, i)
+        if not tag and not style_full:
             continue
 
-        key = base_token(str(key).strip())
+        lines = catalog_text_lines(
+            [(prefix, _cell_text(col, i)) for prefix, col in text_columns]
+        )
+        category = _cell_text(category_series, i)
 
-        lines = []
-        for col in text_columns:
-            val = col.iloc[i]
-            if pd.notna(val):
-                text = str(val).strip()
-                if text and text.lower() != "nan":
-                    lines.append(text)
+        # An image can be named by TagNo ("1001_1.jpg"), by StyleBio
+        # ("RGFMC00475-03.jpg") or by both ("RGFMC00475-03_5.jpg" - StyleBio
+        # plus the TagNo of that row). Register every spelling.
+        keys = []
+        if tag and style_full:
+            keys.append(f"{style_full}_{tag}".lower())
+        if style_full:
+            keys.append(style_full.lower())
+        if tag:
+            keys.append(base_token(tag))
 
-        if lines:
-            mapping[key] = lines
-
-        if category_series is not None:
-            cat = category_series.iloc[i]
-            if pd.notna(cat):
-                category_map[key] = sanitize(cat)
-
-        if style_series is not None:
-            style = style_series.iloc[i]
-            if pd.notna(style):
-                style_map[key] = sanitize(style)[:3]
+        for key in keys:
+            if lines:
+                mapping[key] = lines
+            if category:
+                category_map[key] = sanitize(category)
+            if style_full:
+                style_map[key] = sanitize(style_full)[:3]
 
     return mapping, category_map, style_map
+
+
+def find_excel_key(name, mapping):
+    """The Excel key that belongs to an image file name (without extension)."""
+    name = (name or "").strip().lower()
+    candidates = [name]
+    if "_" in name:
+        candidates.append(name.rsplit("_", 1)[0])   # drop the view number
+        candidates.append(name.split("_", 1)[0])
+    candidates.append(base_token(name))
+    for candidate in candidates:
+        if candidate in mapping:
+            return candidate
+    return base_token(name)
 
 
 # ======================================================
@@ -1157,29 +1189,56 @@ def resize_to_canvas(
 # DRAW TEXT
 # ======================================================
 
+_FONT_CANDIDATES = (
+    WINDOWS_TREBUCHET,
+    "trebuc.ttf",
+    "DejaVuSans.ttf",
+    "LiberationSans-Regular.ttf",
+    "arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/Library/Fonts/Arial.ttf",
+)
+
+
+def load_catalog_font(size):
+    for candidate in _FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def draw_text(img, lines, bg_color_hex=None):
-    lines = lines or []
+    """Write the catalogue lines on the left, bottom-up from the corner."""
+    lines = [l for l in (lines or []) if l]
+    if not lines:
+        return img
     draw = ImageDraw.Draw(img)
 
-    # White text on a light canvas is invisible, so pick black or white
-    # depending on the background brightness.
+    # Black text on a light canvas, white on a dark one.
     fill = "white"
-    if bg_color_hex:
-        r, g, b = hex_to_rgb(bg_color_hex)
-        if (0.299 * r + 0.587 * g + 0.114 * b) > 140:
-            fill = "black"
+    if not bg_color_hex or (
+        0.299 * hex_to_rgb(bg_color_hex)[0]
+        + 0.587 * hex_to_rgb(bg_color_hex)[1]
+        + 0.114 * hex_to_rgb(bg_color_hex)[2]
+    ) > 140:
+        fill = "black"
 
-    try:
-        font = ImageFont.truetype(WINDOWS_TREBUCHET, 28)
-    except Exception:
-        font = ImageFont.load_default()
+    size = max(18, round(img.height * 0.024))
+    font = load_catalog_font(size)
+    step = round(size * 1.3)
+    margin = max(20, round(img.width * 0.015))
 
-    x = 40
-    y = img.height - (35 * len(lines)) - 40
-
+    x = margin
+    y = img.height - step * len(lines) - margin
     for line in lines:
         draw.text((x, y), line, fill=fill, font=font)
-        y += 35
+        y += step
 
     return img
 
@@ -1248,7 +1307,8 @@ def process_images(request):
             key = base_token(name)
             # Transparent-only mode has no Excel mapping, so there is no
             # catalogue text to draw on the preview canvas.
-            lines = mapping.get(key) or []
+            excel_key = find_excel_key(name, mapping)
+            lines = mapping.get(excel_key) or []
 
             per_image_overrides = preset.get("per_image_overrides", {})
             item_override = {}
@@ -1358,9 +1418,6 @@ def process_images(request):
                 max_upscale=float(image_settings.get("max_upscale", 2.0)),
             )
 
-            # Small JPEG thumbnail for the browser; the full files are on disk.
-            preview = image_to_base64_jpeg(thumbnail(white_canvas, 900), quality=88)
-
             # Add catalogue text only when Excel metadata exists.
             if lines:
                 white_canvas = draw_text(
@@ -1368,6 +1425,10 @@ def process_images(request):
                     lines,
                     bg_color_hex or canvas_color or "#FFFFFF",
                 )
+
+            # Small JPEG thumbnail for the browser (with the text on it);
+            # the full files are on disk.
+            preview = image_to_base64_jpeg(thumbnail(white_canvas, 900), quality=88)
 
             # ---------------------------
             # Save Transparent PNG
@@ -1428,8 +1489,8 @@ def process_images(request):
             elif save_format == "WEBP":
                 save_options.update({"quality": 100, "method": 0})
 
-            category = category_map.get(key, "Others")
-            style = style_map.get(key, "OTH")
+            category = category_map.get(excel_key, "Others")
+            style = style_map.get(excel_key, "OTH")
 
             cat_dir = itemwise_base / category
             style_dir = style_base / style
