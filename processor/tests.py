@@ -15,30 +15,25 @@ class JewelryBackgroundRemovalTests(TestCase):
         self.assertTrue(preset["background_removal"]["preserve_prongs_and_claws"])
         self.assertTrue(preset["product_protection"]["no_detail_smoothing"])
 
-    def test_excel_mapping_uses_tagno_and_selected_fields(self):
-        df = pd.DataFrame([
-            {
-                "Category": "RING",
-                "StyleBio": "SB-202",
-                "TagNo": "1001",
-                "DiaWt": "0.90",
-                "ChainWt": "0.10",
-                "GrossWt": "12.50",
-                "StoneWt": "1.20",
-                "Remark": "ok",
-                "Description": "gold ring",
-            }
-        ])
-
+    def test_excel_mapping_uses_column_n_for_names_and_e_to_k_for_text(self):
+        cols = ["Finish Date", "Category", "Sub", "Metal", "StyleBio", "TagNo",
+                "DiaWt", "ChainWt", "GrossWt", "StoneWt", "Remark", "OtherWt",
+                "Description", "ImageName"]
+        row = ["2025-01-01", "RING", "RING", "YELLOW GOLD", "SB-202", "7",
+               "Di.Wt: 3 / 0.90 Ct", "", "Gr Wt: 12.50 Gm", "", "ok", "x",
+               "desc", "My Photo 01.JPG"]
         buffer = io.BytesIO()
-        df.to_excel(buffer, index=False)
+        pd.DataFrame([row], columns=cols).to_excel(buffer, index=False)
         buffer.seek(0)
 
-        mapping, category_map, _ = read_excel_mapping(buffer)
+        mapping, category_map, style_map = read_excel_mapping(buffer)
 
-        self.assertIn("1001", mapping)
-        self.assertEqual(mapping["1001"], ["SB-202", "Di.Wt: 0.90", "Chain Wt: 0.10", "Gr Wt: 12.50"])
-        self.assertEqual(category_map["1001"], "RING")
+        self.assertEqual(
+            mapping["my photo 01"],
+            ["SB-202", "7", "Di.Wt: 3 / 0.90 Ct", "Gr Wt: 12.50 Gm", "ok"],
+        )
+        self.assertEqual(category_map["my photo 01"], "RING")
+        self.assertEqual(style_map["my photo 01"], "SB-")
 
 
 # ----------------------------------------------------------------------
@@ -219,3 +214,34 @@ class OpenworkHollowTests(TestCase):
         self.assertLess((cleaned[hollow] > 0).mean(), 0.05, stats)
         inner_frame = frame & (d >= 113) & (d <= 147)
         self.assertGreater((cleaned[inner_frame] >= 250).mean(), 0.95, stats)
+
+
+class GlassFrameTests(TestCase):
+    def _photo_with_lens(self):
+        import cv2
+        img = np.full((600, 1000, 3), 255, np.uint8)
+        # stadium outline with dark edge lines, like a magnifier inset
+        cv2.rectangle(img, (150, 200), (850, 400), (50, 50, 50), 3)
+        for x in range(150, 851, 25):
+            cv2.line(img, (x, 200), (x, 215), (50, 50, 50), 2)
+            cv2.line(img, (x, 385), (x, 400), (50, 50, 50), 2)
+        for y in range(200, 401, 25):
+            cv2.line(img, (150, y), (165, y), (50, 50, 50), 2)
+            cv2.line(img, (835, y), (850, y), (50, 50, 50), 2)
+        return img
+
+    def test_lens_rim_is_restored_and_inside_left_alone(self):
+        from processor.services.glass_frame import restore_glass_frame
+        src = self._photo_with_lens()
+        rgba = np.zeros((600, 1000, 4), np.uint8)
+        added = restore_glass_frame(rgba, src)
+        self.assertGreater(added, 1000)
+        self.assertGreater(rgba[205, 500, 3], 200)    # rim kept
+        self.assertEqual(rgba[300, 500, 3], 0)        # lens interior untouched
+
+    def test_photo_without_lens_is_untouched(self):
+        from processor.services.glass_frame import restore_glass_frame
+        src = np.full((600, 1000, 3), 240, np.uint8)
+        src[300:310, 100:900] = (20, 20, 20)           # a single dark strip
+        rgba = np.zeros((600, 1000, 4), np.uint8)
+        self.assertEqual(restore_glass_frame(rgba, src), 0)

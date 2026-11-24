@@ -203,3 +203,11 @@ New final pass `finish_edges` (runs after every other clean-up, in strips so 30 
 ## v2.9 - openings between spokes and stone rows
 - New `clear_backdrop_wedges` pass (native resolution): small openings between spokes, wires and stone rows that are exactly the backdrop colour (tiny colour distance, flat, neutral, no sparkle inside, touching metal or stones) are cleared. Diamond facets and shine are not touched.
 - Tunables: `wedge_*` in DEFAULTS; `clear_wedges: False` turns it off.
+
+## v2.9.3 - magnifier lens frame
+Catalogue photos with an inset "glass" (stadium-shaped rim with dark lines and tick
+marks) kept losing parts of the rim. `processor/services/glass_frame.py` finds the
+frame from its closed dark outline and restores the whole rim; the inside of the lens
+stays transparent so the chosen background colour shows through. Photos without a
+frame are not touched. Turn off with `"preserve_glass_frame": false` in the preset's
+`background_removal` block.

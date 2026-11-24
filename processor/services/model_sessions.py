@@ -80,6 +80,30 @@ def active_providers() -> list[str]:
         return ["CPUExecutionProvider"]
 
 
+def _new_session(new_session, model_name: str, opts):
+    """Create a rembg session across rembg versions.
+
+    Some rembg releases accept ``sess_opts=`` and some build their own
+    SessionOptions and raise "got multiple values for argument 'sess_opts'".
+    Try the tuned options first, then fall back to progressively plainer
+    calls so the server keeps working on whatever version is installed.
+    """
+    providers = _providers()
+    attempts = (
+        lambda: new_session(model_name, sess_opts=opts, providers=providers),
+        lambda: new_session(model_name, providers=providers),
+        lambda: new_session(model_name, providers),
+        lambda: new_session(model_name),
+    )
+    last_error = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except TypeError as exc:
+            last_error = exc
+    raise last_error
+
+
 def get_session(model_name: str):
     with _load_lock:
         session = _sessions.get(model_name)
@@ -97,7 +121,7 @@ def get_session(model_name: str):
             threads = int(os.getenv("ONNX_THREADS", "0") or 0)
             if threads > 0:
                 opts.intra_op_num_threads = threads
-            session = new_session(model_name, sess_opts=opts, providers=_providers())
+            session = _new_session(new_session, model_name, opts)
             _sessions[model_name] = session
             _infer_locks[model_name] = threading.Lock()
         return session

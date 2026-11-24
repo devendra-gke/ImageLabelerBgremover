@@ -854,87 +854,73 @@ def read_excel_mapping_cached(excel_file):
     return cached
 
 
-# Catalogue text, in the order it is printed on the image:
-# StyleBio, then Dia Wt, then Chain Wt, then Gross Wt.
-CATALOG_TEXT_FIELDS = [
-    (("StyleBio", "Style Bio"), ""),
-    (("DiaWt", "Dia Wt", "Di.Wt"), "Di.Wt: "),
-    (("ChainWt", "Chain Wt"), "Chain Wt: "),
-    (("GrossWt", "Gross Wt", "Gr Wt"), "Gr Wt: "),
-]
+# Catalogue sheet layout (Excel column letters, 0-based positions):
+#   N -> image file name, E..K -> text printed on the image (in that order),
+#   B -> category folder, E -> StyleBio folder (first 3 letters).
+COL_CATEGORY = 1
+COL_TEXT_FIRST, COL_TEXT_LAST = 4, 9   # E..J
+COL_FILE_NAME = 13                      # N
 
 
-def _cell_text(series, i):
-    if series is None:
+def _cell_text(df, row, col):
+    if col >= df.shape[1]:
         return ""
-    val = series.iloc[i]
+    val = df.iat[row, col]
     if pd.isna(val):
         return ""
     text = str(val).strip()
     return "" if text.lower() == "nan" else text
 
 
-def catalog_text_lines(row_values):
-    """Build the label lines from (prefix, value) pairs, skipping blanks."""
-    lines = []
-    for prefix, text in row_values:
-        if not text:
-            continue
-        # Jewlex exports already say "Di.Wt: 31 / 0.90 Ct"; a bare number
-        # from another sheet gets the label added.
-        if prefix and ":" not in text:
-            text = prefix + text
-        lines.append(text)
-    return lines
+def _file_key(value):
+    """'RGF-1.jpg' / 'rgf-1' -> 'rgf-1' (name without a known image extension)."""
+    value = (value or "").strip()
+    stem, ext = os.path.splitext(value)
+    if ext.lower() in SUPPORTED_EXTS:
+        value = stem
+    return value.lower()
 
 
 def read_excel_mapping(excel_file):
     df = pd.read_excel(excel_file, engine="openpyxl", dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
 
-    key_series = get_named_series(
-        df,
-        "TAGNO",
-        "TagNo",
-        "Tag No",
-        "tag no",
-        "Image Tag",
-    )
-    category_series = get_named_series(df, "Category", "CATEGORY")
-    style_series = get_named_series(df, "StyleBio", "Style Bio", "STYLEBIO")
-    text_columns = [
-        (prefix, get_named_series(df, *names)) for names, prefix in CATALOG_TEXT_FIELDS
-    ]
+    # Older sheets without a file-name column are still matched by TagNo /
+    # StyleBio so they keep working.
+    tag_series = get_named_series(df, "TagNo", "Tag No", "Image Tag")
+    tag_idx = list(df.columns).index(tag_series.name) if tag_series is not None else None
 
     mapping = {}
     category_map = {}
     style_map = {}
 
     for i in range(len(df)):
-        tag = _cell_text(key_series, i)
-        style_full = _cell_text(style_series, i)
-        if not tag and not style_full:
+        lines = [
+            t for t in (
+                _cell_text(df, i, c) for c in range(COL_TEXT_FIRST, COL_TEXT_LAST + 1)
+            ) if t
+        ]
+        if not lines:
             continue
 
-        lines = catalog_text_lines(
-            [(prefix, _cell_text(col, i)) for prefix, col in text_columns]
-        )
-        category = _cell_text(category_series, i)
+        category = _cell_text(df, i, COL_CATEGORY)
+        style_full = _cell_text(df, i, COL_TEXT_FIRST)
 
-        # An image can be named by TagNo ("1001_1.jpg"), by StyleBio
-        # ("RGFMC00475-03.jpg") or by both ("RGFMC00475-03_5.jpg" - StyleBio
-        # plus the TagNo of that row). Register every spelling.
-        keys = []
-        if tag and style_full:
-            keys.append(f"{style_full}_{tag}".lower())
-        if style_full:
-            keys.append(style_full.lower())
-        if tag:
-            keys.append(base_token(tag))
+        file_name = _file_key(_cell_text(df, i, COL_FILE_NAME))
+        if file_name:
+            keys = [file_name]
+        else:
+            tag = _cell_text(df, i, tag_idx) if tag_idx is not None else ""
+            keys = []
+            if tag and style_full:
+                keys.append(f"{style_full}_{tag}".lower())
+            if style_full:
+                keys.append(style_full.lower())
+            if tag:
+                keys.append(base_token(tag))
 
         for key in keys:
-            if lines:
-                mapping[key] = lines
+            mapping[key] = lines
             if category:
                 category_map[key] = sanitize(category)
             if style_full:
@@ -1123,6 +1109,14 @@ def remove_background_detailed(
     if (bg_settings or {}).get("decontaminate_edges", True) and detection.background_small is not None:
         decontaminate_edges(result_arr, detection.background_small)
     output[y0:y1, x0:x1] = result_arr
+    # A magnifier-lens frame printed on the photo is part of the picture:
+    # put its white rim back whole instead of leaving cut-up pieces.
+    try:
+        from .glass_frame import restore_glass_frame
+        detection.timings["glass_px"] = restore_glass_frame(
+            output, np.asarray(source), bg_settings)
+    except Exception:
+        detection.timings["glass_px"] = 0
     detection.timings["protect_s"] = round(time.perf_counter() - t0, 2)
     return Image.fromarray(output, mode="RGBA"), detection
 
