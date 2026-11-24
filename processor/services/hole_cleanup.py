@@ -786,7 +786,10 @@ def _open_backdrop_mask(ctx: MatteContext, before: np.ndarray) -> np.ndarray:
     ext = _exterior_colour(ctx.src, before)
     if ext is None:
         return empty
-    diff = cv2.subtract(ctx.src, ext.reshape(1, 1, 3).astype(np.float32))
+    src_float = ctx.src.astype(np.float32)
+    ext_float = np.asarray(ext, dtype=np.float32).reshape(1, 1, 3)
+
+    diff = np.abs(src_float - ext_float)
     dist = cv2.sqrt(cv2.transform(cv2.multiply(diff, diff), np.ones((1, 3), np.float32)))
     m = ((dist < float(cfg.get("open_backdrop_max_dist", 26.0))) & (ctx.chroma_diff < 0.02) & (ctx.lum_diff <= float(cfg["hole_bright_tolerance"])) & (ctx.fine_texture < float(cfg.get("open_backdrop_max_fine", 3.0)))).astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
