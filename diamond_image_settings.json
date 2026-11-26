@@ -84,6 +84,7 @@
     "facet_min_alpha": 202
   },
   "image_processing": {
+    "keep_original_framing": true,
     "auto_crop": true,
     "crop_mode": "product_centered",
     "maintain_aspect_ratio": true,

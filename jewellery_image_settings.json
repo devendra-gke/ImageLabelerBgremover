@@ -89,6 +89,7 @@
     "white_edge_brightness": 185
   },
   "image_processing": {
+    "keep_original_framing": true,
     "auto_crop": true,
     "crop_mode": "product_centered",
     "maintain_aspect_ratio": true,
