@@ -42,6 +42,8 @@
     },
     "recover_thin_details": true,
     "remove_specks": true,
+    "protect_on_white_backdrop": true,
+    "white_guard_model_alpha": 220,
     "hole_filled_min_area_ratio": 1.0
   },
   "product_protection": {

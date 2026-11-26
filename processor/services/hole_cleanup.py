@@ -146,6 +146,15 @@ DEFAULTS = {
     # specks
     "speck_min_area_ratio": 0.00004,
     "speck_keep_distance_ratio": 0.02,
+    # white (clipped) backdrop guard - see _ClippedBackdropGuard
+    "protect_on_white_backdrop": True,
+    "clipped_backdrop_lum": 245.0,        # backdrop this bright = blown-out white studio backdrop
+    "white_guard_model_alpha": 220,       # model was this sure it is product -> clean-up may not cut it
+    "white_guard_exact_dist": 6.0,        # ... unless the cut region is pure backdrop colour
+    "white_guard_exact_texture": 2.5,     # ... and perfectly flat (a real see-through gap)
+    "white_guard_facet_dark": 35.0,       # neutral pixels this much darker than backdrop = diamond facet lines
+    "white_guard_facet_texture": 8.0,
+    "white_guard_stone_ratio": 0.004,     # stone-zone growth, fraction of diagonal
 }
 
 
@@ -1460,6 +1469,89 @@ def clear_backdrop_wedges(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cf
     return cleared
 
 
+class _ClippedBackdropGuard:
+    """Undo clean-up cuts that remove real product on a pure-white backdrop.
+
+    Most passes tell a diamond facet / polished highlight from a hollow by
+    "brighter than the backdrop". On a blown-out white backdrop (255,255,255)
+    nothing can be brighter, so that safeguard silently switches off: white
+    stones, bright bezel rims and thin gold highlights all look like
+    "backdrop-coloured gaps" and get cut out (visible as missing bits once the
+    PNG is put on a black page). On such photos this guard runs after every
+    hole/gap pass and puts back any cut region that
+
+      * lies in a stone zone (next to neutral, dark facet lines), or
+      * the model was confident about (mean alpha >= white_guard_model_alpha),
+
+    unless the region is pure, perfectly flat backdrop - a real see-through gap.
+    On grey / coloured backdrops it does nothing.
+    """
+
+    def __init__(self, src, bg, model_alpha, cfg, diag):
+        self.on = False
+        self.restored = 0
+        if not cfg.get("protect_on_white_backdrop", True) or model_alpha is None:
+            return
+        bg = bg.astype(np.float32, copy=False)
+        bg_lum = float(np.median(bg[::4, ::4].mean(axis=2)))
+        if bg_lum < float(cfg.get("clipped_backdrop_lum", 245.0)):
+            return
+        self.on = True
+        self.cfg = cfg
+        self.model = model_alpha
+        src = src.astype(np.float32, copy=False)
+        diff = src - bg
+        self.dist = np.sqrt((diff * diff).sum(axis=2))
+        gray = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)
+        self.fine = _local_std(gray, 5)
+        lum = diff.mean(axis=2)
+        mx, mn = src.max(axis=2), src.min(axis=2)
+        neutral = (mx - mn) / np.maximum(mx, 1.0) < 0.10   # diamonds are grey, gold is not
+        facets = (
+            neutral
+            & (lum < -float(cfg.get("white_guard_facet_dark", 35.0)))
+            & (self.fine > float(cfg.get("white_guard_facet_texture", 8.0)))
+            & (model_alpha >= 128)
+        ).astype(np.uint8)
+        r = max(3, int(round(float(cfg.get("white_guard_stone_ratio", 0.004)) * diag)))
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        zone = cv2.dilate(facets, k)
+        self.stone = cv2.morphologyEx(zone, cv2.MORPH_CLOSE, k).astype(bool)
+
+    def __call__(self, before: np.ndarray, alpha: np.ndarray) -> int:
+        if not self.on:
+            return 0
+        cut = ((before.astype(np.int16) - alpha.astype(np.int16)) > 32).astype(np.uint8)
+        if not cut.any():
+            return 0
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(cut, connectivity=8)
+        flat = labels.ravel()
+        areas = np.maximum(stats[:, cv2.CC_STAT_AREA].astype(np.float64), 1)
+        mean = lambda img: np.bincount(flat, weights=img.ravel().astype(np.float64), minlength=count) / areas
+        m_model, m_dist, m_fine, m_stone = mean(self.model), mean(self.dist), mean(self.fine), mean(self.stone)
+        cfg = self.cfg
+        exact = (m_dist < float(cfg.get("white_guard_exact_dist", 6.0))) & \
+                (m_fine < float(cfg.get("white_guard_exact_texture", 2.5)))
+        confident = m_model >= float(cfg.get("white_guard_model_alpha", 220))
+        put_back = ~exact & ((m_stone >= 0.5) | confident)
+        put_back[0] = False
+        if not put_back.any():
+            return 0
+        mask = put_back[labels]
+        alpha[mask] = before[mask]
+        n = int(mask.sum())
+        self.restored += n
+        return n
+
+    def run(self, fn, alpha, *args, **kwargs):
+        """Run one clean-up pass with the guard around it."""
+        before = alpha.copy() if self.on else None
+        result = fn(*args, **kwargs)
+        if self.on:
+            self(before, alpha)
+        return result
+
+
 def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None = None,
                 background: np.ndarray | None = None, reference_size: tuple | None = None):
     """Run every clean-up pass. Returns (alpha, stats, context).
@@ -1477,24 +1569,27 @@ def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None
     model_alpha = alpha.copy()
     ctx = MatteContext(source_rgb, alpha, cfg, background, reference_size)
     shadows = shadow_mask(ctx, alpha)
+    guard = _ClippedBackdropGuard(ctx.src, ctx.bg, model_alpha, cfg, ctx.diag)
+    g = guard.run
     stats = {
         "edge_refined_px": refine_edges(ctx, alpha),
         "border_background_px": remove_border_background(ctx, alpha),
         "shadow_px": remove_shadows(ctx, alpha, shadows),
         "recovered_detail_px": recover_thin_details(ctx, alpha, shadows),
-        "hole_px": remove_enclosed_background(ctx, alpha),
-        "contour_hole_px": remove_hierarchy_holes(ctx, alpha),
-        "pocket_px": open_metal_pockets(ctx, alpha),
-        "hollow_px": open_backdrop_hollows(ctx, alpha),
-        "thin_gap_px": remove_thin_gaps(ctx, alpha),
-        "speck_px": remove_specks(ctx, alpha),
+        "hole_px": g(remove_enclosed_background, alpha, ctx, alpha),
+        "contour_hole_px": g(remove_hierarchy_holes, alpha, ctx, alpha),
+        "pocket_px": g(open_metal_pockets, alpha, ctx, alpha),
+        "hollow_px": g(open_backdrop_hollows, alpha, ctx, alpha),
+        "thin_gap_px": g(remove_thin_gaps, alpha, ctx, alpha),
+        "speck_px": g(remove_specks, alpha, ctx, alpha),
     }
     stats["restored_reflection_px"] = restore_stone_reflections(ctx, model_alpha, alpha)
     stats["solid_stone_px"] = solidify_stones(ctx, alpha)
-    stats["haze_px"] = clear_backdrop_haze(ctx.src, ctx.bg, alpha, cfg)
-    stats["flat_backdrop_px"] = clear_flat_backdrop(ctx.src, ctx.bg, alpha, cfg)
-    stats["wedge_px"] = clear_backdrop_wedges(ctx.src, ctx.bg, alpha, cfg)
-    stats["finished_edge_px"] = finish_edges(ctx.src, ctx.bg, alpha, cfg, ctx.diag, model_alpha)
+    stats["haze_px"] = g(clear_backdrop_haze, alpha, ctx.src, ctx.bg, alpha, cfg)
+    stats["flat_backdrop_px"] = g(clear_flat_backdrop, alpha, ctx.src, ctx.bg, alpha, cfg)
+    stats["wedge_px"] = g(clear_backdrop_wedges, alpha, ctx.src, ctx.bg, alpha, cfg)
+    stats["finished_edge_px"] = g(finish_edges, alpha, ctx.src, ctx.bg, alpha, cfg, ctx.diag, model_alpha)
+    stats["white_backdrop_guard_px"] = guard.restored
     return alpha, stats, ctx
 
 
@@ -1548,10 +1643,13 @@ def _clean_matte_large(source_rgb, alpha, settings, cfg, background, reference_s
         # stone facets: edge refinement must not thin them out again
         out[restored_mask] = np.maximum(out[restored_mask], alpha[restored_mask])
 
-    stats["haze_px"] = clear_backdrop_haze(source_rgb, bg_full, out, cfg)
-    stats["flat_backdrop_px"] = clear_flat_backdrop(source_rgb, bg_full, out, cfg)
-    stats["wedge_px"] = clear_backdrop_wedges(source_rgb, bg_full, out, cfg)
-    stats["finished_edge_px"] = finish_edges(source_rgb, bg_full, out, cfg, float(np.hypot(ref_h, ref_w)), alpha)
+    guard = _ClippedBackdropGuard(source_rgb, bg_full, alpha, cfg, float(np.hypot(ref_h, ref_w)))
+    g = guard.run
+    stats["haze_px"] = g(clear_backdrop_haze, out, source_rgb, bg_full, out, cfg)
+    stats["flat_backdrop_px"] = g(clear_flat_backdrop, out, source_rgb, bg_full, out, cfg)
+    stats["wedge_px"] = g(clear_backdrop_wedges, out, source_rgb, bg_full, out, cfg)
+    stats["finished_edge_px"] = g(finish_edges, out, source_rgb, bg_full, out, cfg, float(np.hypot(ref_h, ref_w)), alpha)
+    stats["white_backdrop_guard_px"] = stats.get("white_backdrop_guard_px", 0) + guard.restored
 
     class _FullCtx:
         """What callers use from the context, at full resolution."""

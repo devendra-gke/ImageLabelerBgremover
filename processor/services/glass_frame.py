@@ -7,6 +7,14 @@ rim to pieces. This module finds the frame from its dark lines and puts the
 whole rim back, with the inside left to the normal cut-out (so the chosen
 background colour shows through the lens).
 
+Two kinds of frame are recognised:
+
+* round / oval lenses drawn with thin light-grey lines and tick marks
+  (``_ring_frame``): the lines are fitted with an ellipse and the whole band
+  between the inner and outer line is restored - including the parts the
+  product or the clean-up broke up;
+* stadium-shaped frames drawn with dark lines (``_largest_frame``).
+
 Detection is purely geometric and gated, so photos without a lens frame are
 not touched:
   * dark, neutral (grey/black) pixels are joined into components,
@@ -32,6 +40,17 @@ DEFAULTS = {
     "glass_outline_coverage": 0.9,  # share of the outline traced by dark pixels
     "glass_rim_ratio": 0.085,     # rim width / frame height
     "glass_proxy_side": 1750,
+    "glass_min_hull_fill": 0.6,   # hull area / bbox area (a sloped bead chain is thin)
+    # round / oval lens drawn with light-grey lines
+    "glass_ring_enabled": True,
+    "glass_ring_min_lum": 110,    # line pixels: brighter than black beads ...
+    "glass_ring_max_lum": 242,    # ... darker than the white backdrop ...
+    "glass_ring_max_chroma": 14,  # ... and neutral (not gold)
+    "glass_ring_min_size": 0.15,  # ellipse minor axis / shorter image side
+    "glass_ring_fit_share": 0.85, # component pixels lying on the fitted ring band
+    "glass_ring_coverage": 0.75,  # share of the circumference traced by lines
+    "glass_ring_max_width": 0.12, # band width / radius (a filled disc is not a rim)
+    "glass_ring_pad_px": 1.5,     # anti-aliased line edge kept on both sides
 }
 
 
@@ -65,6 +84,10 @@ def _largest_frame(rgb: np.ndarray, cfg: dict):
         hull = cv2.convexHull(pts)
         hull_mask = np.zeros((h, w), np.uint8)
         cv2.fillConvexPoly(hull_mask, hull, 1)
+        # A frame encloses an area; a diagonal bead chain only has a thin hull
+        # (it used to be taken for a frame and got a white band painted round it).
+        if hull_mask.sum() < cfg["glass_min_hull_fill"] * bw * bh:
+            continue
 
         # Every dark pixel of a lens frame sits on its outline: near the
         # hull border, not scattered over the inside of the piece.
@@ -91,6 +114,69 @@ def _largest_frame(rgb: np.ndarray, cfg: dict):
     return best[1], best[2]
 
 
+def _ellipse_rho(shape, ellipse):
+    """Normalised elliptical radius of every pixel (1.0 = on the ellipse)."""
+    (cx, cy), (d1, d2), ang = ellipse
+    h, w = shape
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    t = np.deg2rad(ang)
+    dx, dy = xs - cx, ys - cy
+    u = dx * np.cos(t) + dy * np.sin(t)
+    v = -dx * np.sin(t) + dy * np.cos(t)
+    return np.sqrt((u / (d1 / 2.0)) ** 2 + (v / (d2 / 2.0)) ** 2), np.arctan2(v, u)
+
+
+def _ring_frame(rgb: np.ndarray, cfg: dict):
+    """Find a round/oval lens drawn with light-grey lines.
+
+    Returns a boolean rim mask on the proxy, or None.
+    """
+    if not cfg.get("glass_ring_enabled", True):
+        return None
+    h, w = rgb.shape[:2]
+    rgb_i = rgb.astype(np.int16)
+    lum = rgb_i.mean(axis=2)
+    chroma = rgb_i.max(axis=2) - rgb_i.min(axis=2)
+    line = ((lum > cfg["glass_ring_min_lum"]) & (lum < cfg["glass_ring_max_lum"])
+            & (chroma < cfg["glass_ring_max_chroma"])).astype(np.uint8)
+    if line.sum() < 500:
+        return None
+    joined = cv2.dilate(line, np.ones((3, 3), np.uint8))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    min_size = cfg["glass_ring_min_size"] * min(h, w)
+    order = np.argsort(-stats[1:, cv2.CC_STAT_AREA]) + 1
+    for i in order[:8]:
+        x, y, bw, bh, area = stats[i]
+        if min(bw, bh) < min_size:
+            continue
+        comp = (labels == i) & (line > 0)
+        ys, xs = np.nonzero(comp)
+        if xs.size < 5 * max(bw, bh):
+            continue
+        ellipse = cv2.fitEllipse(np.stack([xs, ys], axis=1).astype(np.float32))
+        (cx, cy), (d1, d2), _ = ellipse
+        if min(d1, d2) < min_size:
+            continue
+        rho, theta = _ellipse_rho((h, w), ellipse)
+        r = rho[comp]
+        lo, hi = np.percentile(r, [2, 98])
+        if hi - lo > cfg["glass_ring_max_width"] or float(((r >= lo) & (r <= hi)).mean()) < cfg["glass_ring_fit_share"]:
+            continue
+        # take in every line pixel on the band (pieces split off by the
+        # chain or the pendant), then re-measure the band
+        pad = cfg["glass_ring_pad_px"] / (min(d1, d2) / 2.0)
+        band_lines = (line > 0) & (rho >= lo - pad) & (rho <= hi + pad)
+        r = rho[band_lines]
+        lo, hi = np.percentile(r, [0.5, 99.5])
+        # the whole circumference must be drawn (a closed lens, not an arc of chain)
+        bins = ((theta[band_lines] + np.pi) / (2 * np.pi) * 180).astype(int).clip(0, 179)
+        coverage = np.unique(bins).size / 180.0
+        if coverage < cfg["glass_ring_coverage"]:
+            continue
+        return (rho >= lo - pad) & (rho <= hi + pad)
+    return None
+
+
 def glass_frame_mask(source_rgb: np.ndarray, settings: dict | None = None):
     """Soft 0..1 mask (full resolution) of the lens rim, or None."""
     cfg = {**DEFAULTS, **(settings or {})}
@@ -103,14 +189,15 @@ def glass_frame_mask(source_rgb: np.ndarray, settings: dict | None = None):
                            interpolation=cv2.INTER_AREA)
     else:
         proxy = source_rgb
-    found = _largest_frame(proxy, cfg)
-    if found is None:
-        return None
-    hull, frame_h = found
-
-    rim_w = max(3, int(round(frame_h * cfg["glass_rim_ratio"]))) * 2 + 1
-    inner = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rim_w, rim_w)))
-    rim = (hull > 0) & ~(inner > 0)
+    rim = _ring_frame(proxy, cfg)
+    if rim is None:
+        found = _largest_frame(proxy, cfg)
+        if found is None:
+            return None
+        hull, frame_h = found
+        rim_w = max(3, int(round(frame_h * cfg["glass_rim_ratio"]))) * 2 + 1
+        inner = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rim_w, rim_w)))
+        rim = (hull > 0) & ~(inner > 0)
     mask = rim.astype(np.float32)
     if scale < 1.0:
         mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_LINEAR)
