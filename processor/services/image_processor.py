@@ -1160,8 +1160,14 @@ def resize_to_canvas(
         new_size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
         if new_size != image.size:
             image = image.resize(new_size, Image.Resampling.LANCZOS)
-    else:
-        image.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+    elif image.size != (target_width, target_height):
+        # scale the whole photo to fit (never crop, never resample when the
+        # upload already has the canvas size - pixels stay identical;
+        # smaller photos are not blown up)
+        scale = min(target_width / image.width, target_height / image.height, 1.0)
+        new_size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+        if new_size != image.size:
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
 
     if bg_color_hex:
         bg = hex_to_rgb(bg_color_hex)
@@ -1335,6 +1341,11 @@ def process_images(request):
             # ---------------------------
             with Image.open(img_file) as opened_image:
                 source_rgba = opened_image.convert("RGBA")
+                # keep the colour profile / camera data so the saved file
+                # looks the same as the upload in every viewer
+                source_icc = opened_image.info.get("icc_profile")
+                source_exif = opened_image.info.get("exif")
+                source_dpi = opened_image.info.get("dpi")
             im = source_rgba.convert("RGB")
             existing_alpha = source_rgba.getchannel("A")
             has_existing_transparency = existing_alpha.getextrema()[0] < 255
@@ -1398,12 +1409,17 @@ def process_images(request):
             # ---------------------------
             # White Canvas
             # ---------------------------
+            # keep_original_framing: the product stays exactly where it was in
+            # the upload (same size, same position, no re-scaling), so the
+            # saved JPG matches the uploaded photo. If the preset canvas has a
+            # different size the whole photo is scaled once, never cropped.
+            keep_framing = bool(image_settings.get("keep_original_framing", True))
             white_canvas = resize_to_canvas(
                 transparent_im,
                 bg_color_hex or canvas_color or "#FFFFFF",
                 width,
                 height,
-                auto_crop=bool(image_settings.get("auto_crop", False)),
+                auto_crop=bool(image_settings.get("auto_crop", False)) and not keep_framing,
                 padding_percent=(
                     image_settings.get("padding_percent", 0)
                     if image_settings.get("add_padding", True)
@@ -1433,7 +1449,8 @@ def process_images(request):
                 transparent_path,
                 format="PNG",
                 compress_level=1,
-                dpi=(300, 300)
+                dpi=tuple(source_dpi) if source_dpi else (300, 300),
+                **({"icc_profile": source_icc} if source_icc else {}),
             )
 
             extra = {
@@ -1475,11 +1492,18 @@ def process_images(request):
             else:
                 save_format = "PNG"
 
-            save_options = {"dpi": (300, 300)}
+            save_options = {"dpi": tuple(source_dpi) if source_dpi else (300, 300)}
+            if source_icc and save_format in ("JPEG", "PNG", "WEBP"):
+                save_options["icc_profile"] = source_icc
+            if source_exif and save_format in ("JPEG", "WEBP"):
+                save_options["exif"] = source_exif
             if save_format == "PNG":
                 save_options["compress_level"] = 1
             elif save_format == "JPEG":
-                save_options.update({"quality": 100, "optimize": False})
+                # subsampling=0 (4:4:4): full colour resolution. Pillow's
+                # default 4:2:0 halves colour detail and blurs thin gold
+                # chains and diamond edges against the background.
+                save_options.update({"quality": 100, "optimize": False, "subsampling": 0})
             elif save_format == "WEBP":
                 save_options.update({"quality": 100, "method": 0})
 

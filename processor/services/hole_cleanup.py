@@ -155,6 +155,13 @@ DEFAULTS = {
     "white_guard_facet_dark": 35.0,       # neutral pixels this much darker than backdrop = diamond facet lines
     "white_guard_facet_texture": 8.0,
     "white_guard_stone_ratio": 0.004,     # stone-zone growth, fraction of diagonal
+    # white backdrop showing through tiny gaps (between chain links and beads)
+    "clear_white_pockets": True,
+    "white_pocket_min_lum": 245.0,        # all channels at least this bright
+    "white_pocket_max_px": 150,           # always cleared up to this size ...
+    "white_pocket_big_ratio": 0.0002,     # ... up to this share of the image when not solid
+    "white_pocket_big_max_alpha": 230,    # (mean alpha below this: the model was unsure)
+    "white_pocket_max_facet_share": 0.3,  # rim mostly grey facets -> diamond sparkle, keep
 }
 
 
@@ -1469,6 +1476,63 @@ def clear_backdrop_wedges(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cf
     return cleared
 
 
+def clear_white_pockets(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict) -> int:
+    """Final pass for white backdrops: clear tiny pure-white pockets.
+
+    Between chain links, beads and jump rings the white backdrop shows through
+    gaps of a few pixels. They are too small for the hole passes, so they stay
+    opaque and show as white dots on a dark page. A pocket is cleared when its
+    rim is gold / black bead; a white spot ringed by grey facets is diamond
+    sparkle and is kept.
+    """
+    if not cfg.get("clear_white_pockets", True):
+        return 0
+    bg_lum = float(np.median(bg[::4, ::4].astype(np.float32).mean(axis=2)))
+    if bg_lum < float(cfg.get("clipped_backdrop_lum", 245.0)):
+        return 0
+    s = src.astype(np.float32, copy=False)
+    mn = s.min(axis=2)
+    mx = s.max(axis=2)
+    lum = s.mean(axis=2)
+    white = ((mn >= float(cfg.get("white_pocket_min_lum", 245.0))) & (alpha > 0)).astype(np.uint8)
+    if not white.any():
+        return 0
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+    grey_facet = ((mx - mn) < 20) & (lum > 90) & (lum < float(cfg.get("white_pocket_min_lum", 245.0)))
+    max_px = int(cfg.get("white_pocket_max_px", 150))
+    max_share = float(cfg.get("white_pocket_max_facet_share", 0.3))
+    k = np.ones((5, 5), np.uint8)
+    clear = np.zeros(alpha.shape, bool)
+    big_px = max(max_px, int(float(cfg.get("white_pocket_big_ratio", 0.0002)) * alpha.size))
+    big_alpha = float(cfg.get("white_pocket_big_max_alpha", 230))
+    for i in range(1, count):
+        x, y, w, h, area = stats[i]
+        if area > big_px:
+            continue
+        if area > max_px:
+            # larger pocket (inside a jump ring): only when the model itself
+            # was unsure - a solid white highlight on gold stays
+            if float(alpha[y:y + h, x:x + w][labels[y:y + h, x:x + w] == i].mean()) >= big_alpha:
+                continue
+        y0, y1, x0, x1 = max(0, y - 3), y + h + 3, max(0, x - 3), x + w + 3
+        comp = (labels[y0:y1, x0:x1] == i).astype(np.uint8)
+        ring = (cv2.dilate(comp, k) > 0) & (comp == 0) & (alpha[y0:y1, x0:x1] >= 128) & (white[y0:y1, x0:x1] == 0)
+        if ring.sum() == 0:
+            continue
+        if float(grey_facet[y0:y1, x0:x1][ring].mean()) >= max_share:
+            continue                       # diamond sparkle
+        clear[y0:y1, x0:x1] |= comp.astype(bool)
+    if not clear.any():
+        return 0
+    # soft edge: pale, neutral pixels right beside the pocket are mostly backdrop too
+    edge = cv2.dilate(clear.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool) & ~clear
+    edge &= ((mx - mn) < 25) & (lum > 225)
+    n = int((alpha[clear] > 0).sum())
+    alpha[clear] = 0
+    alpha[edge] = (alpha[edge] * 0.35).astype(np.uint8)
+    return n
+
+
 class _ClippedBackdropGuard:
     """Undo clean-up cuts that remove real product on a pure-white backdrop.
 
@@ -1590,6 +1654,7 @@ def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None
     stats["wedge_px"] = g(clear_backdrop_wedges, alpha, ctx.src, ctx.bg, alpha, cfg)
     stats["finished_edge_px"] = g(finish_edges, alpha, ctx.src, ctx.bg, alpha, cfg, ctx.diag, model_alpha)
     stats["white_backdrop_guard_px"] = guard.restored
+    stats["white_pocket_px"] = clear_white_pockets(ctx.src, ctx.bg, alpha, cfg)
     return alpha, stats, ctx
 
 
@@ -1650,6 +1715,7 @@ def _clean_matte_large(source_rgb, alpha, settings, cfg, background, reference_s
     stats["wedge_px"] = g(clear_backdrop_wedges, out, source_rgb, bg_full, out, cfg)
     stats["finished_edge_px"] = g(finish_edges, out, source_rgb, bg_full, out, cfg, float(np.hypot(ref_h, ref_w)), alpha)
     stats["white_backdrop_guard_px"] = stats.get("white_backdrop_guard_px", 0) + guard.restored
+    stats["white_pocket_px"] = clear_white_pockets(source_rgb, bg_full, out, cfg)
 
     class _FullCtx:
         """What callers use from the context, at full resolution."""

@@ -43,6 +43,16 @@ DETECTION_DEFAULTS = {
     "min_part_ratio": 0.00003,         # of image area
     "refine": True,                    # accurate model on the crop (always fast path)
     "refine_margin": 0.12,             # padding around the box, fraction of its long side
+    # Parts the quick locate model missed (a thin bracelet next to a big
+    # close-up inset) are still kept when they are clearly metal-coloured.
+    "unseen_parts": True,
+    "unseen_min_metal_share": 0.15,    # share of the part's pixels with gold/rose colour
+    "unseen_metal_chroma": 25.0,       # max-min channel spread that counts as metal colour
+    "unseen_min_long_side": 0.05,      # part's long side / image long side
+    # Cut out every separate item on its own crop as well, so each one is
+    # the main subject for the model (thin chains are otherwise lost).
+    "refine_each_part": True,
+    "refine_part_margin": 0.06,
 }
 
 
@@ -135,6 +145,36 @@ def find_product_parts(source_rgb: np.ndarray, coarse_alpha: np.ndarray, cfg: di
         return [], None
     largest = max(cluster_area[c] for c in seen_clusters)
     min_area = max(9.0, float(cfg["min_part_ratio"]) * h * w, 0.01 * largest)
+
+    # Clusters the saliency model did not see: keep the ones that are clearly
+    # jewellery (gold / rose-gold coloured and big enough). Printed text,
+    # dust and backdrop marks are neutral grey/black and stay out.
+    if cfg.get("unseen_parts", True):
+        rgb_i = source_rgb.astype(np.int16)
+        metal = (rgb_i.max(axis=2) - rgb_i.min(axis=2)) > float(cfg["unseen_metal_chroma"])
+        flat_cluster = np.zeros(count, np.int64)
+        for i in range(1, count):
+            flat_cluster[i] = cluster_of[i]
+        cl_map = flat_cluster[labels]
+        on = combined.astype(bool)
+        ids = cl_map[on]
+        n_c = int(flat_cluster.max()) + 1
+        tot = np.bincount(ids, minlength=n_c).astype(np.float64)
+        met = np.bincount(ids, weights=metal[on].astype(np.float64), minlength=n_c)
+        ext = {}
+        for i in range(1, count):
+            c = cluster_of[i]
+            x, y, bw, bh = (int(v) for v in stats[i, :4])
+            e = ext.setdefault(c, [x, y, x + bw, y + bh])
+            e[0], e[1], e[2], e[3] = min(e[0], x), min(e[1], y), max(e[2], x + bw), max(e[3], y + bh)
+        min_long = float(cfg["unseen_min_long_side"]) * max(h, w)
+        for c, e in ext.items():
+            if c in seen_clusters or cluster_area[c] < min_area or tot[c] == 0:
+                continue
+            if max(e[2] - e[0], e[3] - e[1]) < min_long:
+                continue
+            if met[c] / tot[c] >= float(cfg["unseen_min_metal_share"]):
+                seen_clusters.add(c)
 
     groups: dict[int, list] = {}
     for idx in range(1, count):
@@ -278,6 +318,18 @@ def cutout_jewellery(image: Image.Image, bg_settings: dict | None = None) -> Cut
     crop = source.crop(tuple(roi))
     alpha = predict_alpha(crop, model)
     result.refined = (x1 - x0) * (y1 - y0) < 0.9 * W * H
+    # Several separate items (e.g. close-up inset + the full bracelet): cut
+    # each one out on its own crop too and keep the strongest answer, so a
+    # thin chain is not dropped because a bigger item dominates the crop.
+    if cfg.get("refine_each_part", True) and len(boxes) > 1 and detector_used != "prompt":
+        for b in boxes:
+            bx0, by0, bx1, by1 = _expand_box(b, float(cfg["refine_part_margin"]), W, H)
+            bx0, by0, bx1, by1 = max(bx0, x0), max(by0, y0), min(bx1, x1), min(by1, y1)
+            if bx1 - bx0 < 8 or by1 - by0 < 8:
+                continue
+            part = predict_alpha(source.crop((bx0, by0, bx1, by1)), model)
+            view = alpha[by0 - y0:by1 - y0, bx0 - x0:bx1 - x0]
+            np.maximum(view, part, out=view)
     timings["cutout_model_s"] = round(time.perf_counter() - t0, 2)
 
     if detector_used == "prompt":
