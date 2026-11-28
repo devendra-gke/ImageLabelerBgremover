@@ -155,13 +155,44 @@ DEFAULTS = {
     "white_guard_facet_dark": 35.0,       # neutral pixels this much darker than backdrop = diamond facet lines
     "white_guard_facet_texture": 8.0,
     "white_guard_stone_ratio": 0.004,     # stone-zone growth, fraction of diagonal
+    # light grey / off-white studio backdrops: diamonds are the same grey as
+    # the backdrop, so stones get holes punched in them the same way
+    "protect_on_light_backdrop": True,
+    "light_backdrop_lum": 170.0,
+    "light_backdrop_max_chroma": 0.12,
+    "light_guard_exact_dist": 10.0,       # real see-through gap on a noisy grey backdrop
+    "light_guard_exact_texture": 3.5,
+    "light_guard_exact_share": 0.5,       # (white backdrops) share of backdrop-like pixels -> real opening
+    # light grey backdrops: a real opening is backdrop-coloured almost everywhere;
+    # a dull diamond facet only partly. Colour distance does not depend on the
+    # photo's resolution (texture windows do), so this works from 2 to 30 MP.
+    "light_opening_near_dist": 10.0,
+    "light_opening_near_share": 0.65,
+    "light_backdrop_like_lum": 30.0,      # backdrop-like: brightness within this of the backdrop ...
+    "light_backdrop_like_sat": 0.10,      # ... neutral ...
+    "light_backdrop_like_texture": 6.0,   # ... and flat in a 3 px window (diamonds are not)
+    "fill_stone_holes": True,             # close holes inside diamonds (model or clean-up made)
+    "stone_hole_max_ratio": 0.0004,       # largest hole closed, share of the image
     # white backdrop showing through tiny gaps (between chain links and beads)
     "clear_white_pockets": True,
     "white_pocket_min_lum": 245.0,        # all channels at least this bright
-    "white_pocket_max_px": 150,           # always cleared up to this size ...
+    "white_pocket_max_px": 150,           # always cleared up to this size (at 2 MP; grows with the photo) ...
+    "white_pocket_ref_px": 2_000_000,
     "white_pocket_big_ratio": 0.0002,     # ... up to this share of the image when not solid
     "white_pocket_big_max_alpha": 230,    # (mean alpha below this: the model was unsure)
     "white_pocket_max_facet_share": 0.3,  # rim mostly grey facets -> diamond sparkle, keep
+    "backdrop_pocket_darker": 15.0,       # light backdrop: pocket pixels at most this darker than the backdrop
+    "backdrop_pocket_brighter": 40.0,     # ... and at most this brighter (lit by the metal around)
+    "backdrop_pocket_sat": 0.15,          # ... nearly neutral
+    "backdrop_pocket_min_ratio": 4e-6,
+    # an opening that matches the backdrop almost exactly over a fair area
+    # is backdrop even when diamonds surround it (openings in a stone ring)
+    "backdrop_pocket_exact_lum": 8.0,
+    "backdrop_pocket_exact_sat": 0.05,
+    "backdrop_pocket_exact_min_px": 40,
+    "backdrop_pocket_exact_flat_share": 0.15,  # share of perfectly flat pixels (dull diamond facets have ~0.08)
+    "backdrop_pocket_exact_max_ratio": 0.001,    # smaller pale spots on metal are highlights, not holes
+    "backdrop_pocket_texture": 22.0,      # ... and not facet-textured (3 px window: pockets are thin)
 }
 
 
@@ -1183,6 +1214,30 @@ def solidify_stones(ctx: MatteContext, alpha: np.ndarray) -> int:
     return changed
 
 
+def _colour_measures(src: np.ndarray, bg: np.ndarray):
+    """(dist, dlum, chroma, warm) between a photo region and its backdrop.
+
+    dist   - colour distance to the backdrop
+    dlum   - brightness difference (positive = brighter than the backdrop)
+    chroma - largest per-channel difference of the normalised colours
+    warm   - red minus blue share of the photo colour (gold / rose metal)
+
+    Per-channel OpenCV arithmetic: same numbers as the numpy expressions it
+    replaces, without the slow reductions over the colour axis.
+    """
+    c0, c1, c2 = cv2.split(np.ascontiguousarray(src, dtype=np.float32))
+    b0, b1, b2 = cv2.split(np.ascontiguousarray(bg, dtype=np.float32))
+    d0, d1, d2 = c0 - b0, c1 - b1, c2 - b2
+    dist = cv2.sqrt(d0 * d0 + d1 * d1 + d2 * d2)
+    dlum = (d0 + d1 + d2) / np.float32(3.0)
+    ss = c0 + c1 + c2 + 1.0
+    bs = b0 + b1 + b2 + 1.0
+    n0, n2 = c0 / ss, c2 / ss
+    chroma = cv2.max(cv2.max(cv2.absdiff(n0, b0 / bs), cv2.absdiff(c1 / ss, b1 / bs)),
+                     cv2.absdiff(n2, b2 / bs))
+    return dist, dlum, chroma, n0 - n2
+
+
 def clear_backdrop_haze(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict) -> int:
     """Final pass: a semi-transparent pixel that is exactly backdrop colour is
     haze, not product. A real edge pixel is a blend with the metal, so its
@@ -1199,14 +1254,7 @@ def clear_backdrop_haze(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg:
         cand = (a > 0) & (a < float(cfg.get("haze_max_alpha", 200)))
         if not cand.any():
             continue
-        s = src[sl].astype(np.float32)
-        b = bg[sl].astype(np.float32)
-        diff = s - b
-        dist = np.sqrt((diff * diff).sum(axis=2))
-        lum = diff.mean(axis=2)
-        s_n = s / (s.sum(axis=2, keepdims=True) + 1.0)
-        b_n = b / (b.sum(axis=2, keepdims=True) + 1.0)
-        chroma = np.abs(s_n - b_n).max(axis=2)
+        dist, lum, chroma, _ = _colour_measures(src[sl], bg[sl])
         haze = cand & (dist < tol) & (chroma < float(cfg.get("haze_chroma", 0.03))) & (lum <= bright)
         cleared += int(haze.sum())
         a[haze] = 0
@@ -1229,11 +1277,7 @@ def clear_flat_backdrop(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg:
     S = small(src).astype(np.float32)
     B = small(bg).astype(np.float32)
     A = small(alpha)
-    diff = S - B
-    dist = np.sqrt((diff * diff).sum(axis=2))
-    s_n = S / (S.sum(axis=2, keepdims=True) + 1.0)
-    b_n = B / (B.sum(axis=2, keepdims=True) + 1.0)
-    chroma = np.abs(s_n - b_n).max(axis=2)
+    dist, _, chroma, warm_n = _colour_measures(S, B)
     m = ((A > 0) & (dist < float(cfg.get("flat_backdrop_dist", 60.0)))
          & (chroma < float(cfg.get("flat_backdrop_chroma", 0.04)))).astype(np.uint8)
     k = int(cfg.get("flat_backdrop_open", 7))
@@ -1247,7 +1291,7 @@ def clear_flat_backdrop(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg:
     # A real opening is framed by metal; a flat facet inside a diamond is
     # framed by other (neutral) facets. Keep only blobs whose border is mostly
     # warm metal.
-    warm = ((s_n[..., 0] - s_n[..., 2]) > float(cfg.get("flat_backdrop_warm", 0.06)))
+    warm = warm_n > float(cfg.get("flat_backdrop_warm", 0.06))
     need = float(cfg.get("flat_backdrop_metal_frac", 0.6))
     ok = []
     k3, k9 = np.ones((3, 3), np.uint8), np.ones((9, 9), np.uint8)
@@ -1287,11 +1331,7 @@ def _finish_strip(src, bg, alpha, cfg, sigma, protect_rows, ref=None):
     edge = contour | ((a > 0.01) & (a < 0.99))
     band = cv2.dilate(edge.astype(np.uint8), kb) > 0
 
-    S = src.astype(np.float32)
-    B = bg.astype(np.float32)
-    diff = S - B
-    d = np.sqrt((diff * diff).sum(axis=2))
-    lum = diff.mean(axis=2)
+    d, lum, chroma, warm_n = _colour_measures(src, bg)
     # Stone clusters / texture: lots of contour in a small window, or sparkle
     # right next to it. Facets and diamond shine are left exactly as they are.
     zr = int(cfg.get("finish_zone_px", 21))
@@ -1300,9 +1340,6 @@ def _finish_strip(src, bg, alpha, cfg, sigma, protect_rows, ref=None):
     stone = (density > float(cfg.get("finish_zone_density", 0.16))) | spark
     stone = cv2.dilate(stone.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     band &= ~stone
-    s_n = S / (S.sum(axis=2, keepdims=True) + 1.0)
-    b_n = B / (B.sum(axis=2, keepdims=True) + 1.0)
-    chroma = np.abs(s_n - b_n).max(axis=2)
 
     out = a.copy()
     # 1. smooth the contour: blur, then re-sharpen around 50 % so the edge is
@@ -1334,7 +1371,7 @@ def _finish_strip(src, bg, alpha, cfg, sigma, protect_rows, ref=None):
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
         n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
         if n > 1:
-            warm = (s_n[..., 0] - s_n[..., 2]) > float(cfg.get("flat_backdrop_warm", 0.06))
+            warm = warm_n > float(cfg.get("flat_backdrop_warm", 0.06))
             hmax = float(cfg.get("tiny_hole_max_px", 400))
             H, W = m.shape
             for i in range(1, n):
@@ -1420,14 +1457,7 @@ def clear_backdrop_wedges(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cf
         a = alpha[py0:py1]
         if not (a > 0).any():
             continue
-        S = src[py0:py1].astype(np.float32)
-        B = bg[py0:py1].astype(np.float32)
-        diff = S - B
-        d = np.sqrt((diff * diff).sum(axis=2))
-        lum = diff.mean(axis=2)
-        s_n = S / (S.sum(axis=2, keepdims=True) + 1.0)
-        b_n = B / (B.sum(axis=2, keepdims=True) + 1.0)
-        chroma = np.abs(s_n - b_n).max(axis=2)
+        d, lum, chroma, warm_n = _colour_measures(src[py0:py1], bg[py0:py1])
         m = ((a > 0) & (d < float(cfg.get("wedge_dist", 24.0))) & (chroma < float(cfg.get("wedge_chroma", 0.03)))
              & (lum <= 6.0)).astype(np.uint8)
         if not m.any():
@@ -1436,7 +1466,7 @@ def clear_backdrop_wedges(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cf
         n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
         if n <= 1:
             continue
-        warm = (s_n[..., 0] - s_n[..., 2]) > float(cfg.get("flat_backdrop_warm", 0.06))
+        warm = warm_n > float(cfg.get("flat_backdrop_warm", 0.06))
         h_, w_ = m.shape
         top_ok = overlap if py0 > 0 else -1
         bot_ok = (py1 - py0) - overlap if py1 < H else (py1 - py0) + 1
@@ -1476,79 +1506,236 @@ def clear_backdrop_wedges(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cf
     return cleared
 
 
-def clear_white_pockets(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict) -> int:
-    """Final pass for white backdrops: clear tiny pure-white pockets.
+def _light_backdrop(bg: np.ndarray, cfg: dict) -> bool:
+    b = bg[::4, ::4].astype(np.float32).reshape(-1, 3)
+    lum = float(np.median(b.mean(axis=1)))
+    mx, mn = np.median(b.max(axis=1)), np.median(b.min(axis=1))
+    return lum >= float(cfg.get("light_backdrop_lum", 170.0)) and \
+        (mx - mn) / max(mx, 1.0) < float(cfg.get("light_backdrop_max_chroma", 0.12))
 
-    Between chain links, beads and jump rings the white backdrop shows through
-    gaps of a few pixels. They are too small for the hole passes, so they stay
-    opaque and show as white dots on a dark page. A pocket is cleared when its
-    rim is gold / black bead; a white spot ringed by grey facets is diamond
-    sparkle and is kept.
+
+class _PixelFeatures:
+    """Per-pixel colour measures shared by the white/grey backdrop passes.
+
+    Computed once per image (``_features``) with per-channel OpenCV ops and
+    reused by the guard and the pocket pass.
+
+    The thresholds of those passes (texture windows, "flat" shares) were tuned
+    on photos of about 4000 px diagonal. On a 30 MP photo the same diamond
+    facet is twice as large, looks twice as "flat" in a 3 px window, and gets
+    mistaken for backdrop. So for large photos the measures are computed on a
+    copy reduced to that analysis scale and then enlarged back: the decisions
+    are the same at every resolution (and it is faster).
+    """
+
+    ANALYSIS_DIAG = 4000.0
+
+    def __init__(self, src: np.ndarray, bg: np.ndarray, photo_diag: float | None = None):
+        h, w = src.shape[:2]
+        diag = float(photo_diag or np.hypot(h, w))
+        f = max(1, int(round(diag / self.ANALYSIS_DIAG)))
+        self.factor = f
+        self._full = (w, h)
+        s = src if src.dtype == np.float32 else src.astype(np.float32)
+        b = bg if bg.dtype == np.float32 else bg.astype(np.float32)
+        if f > 1:
+            small = (max(1, w // f), max(1, h // f))
+            s = cv2.resize(s, small, interpolation=cv2.INTER_AREA)
+            b = cv2.resize(b, small, interpolation=cv2.INTER_AREA)
+        c0, c1, c2 = cv2.split(np.ascontiguousarray(s))
+        b0, b1, b2 = cv2.split(np.ascontiguousarray(b))
+        mx = cv2.max(cv2.max(c0, c1), c2)
+        mn = cv2.min(cv2.min(c0, c1), c2)
+        lum = (c0 + c1 + c2) / np.float32(3.0)
+        dlum = lum - (b0 + b1 + b2) / np.float32(3.0)
+        d0, d1, d2 = c0 - b0, c1 - b1, c2 - b2
+        dist = cv2.sqrt(d0 * d0 + d1 * d1 + d2 * d2)
+        sat = (mx - mn) / cv2.max(mx, 1.0)
+        self._gray_small = cv2.cvtColor(s, cv2.COLOR_RGB2GRAY)
+        up = self._up
+        self.mx, self.mn, self.lum, self.dlum = up(mx), up(mn), up(lum), up(dlum)
+        self.dist, self.sat = up(dist), up(sat)
+        self._tex = {}
+
+    def _up(self, img: np.ndarray) -> np.ndarray:
+        if self.factor == 1:
+            return img
+        return cv2.resize(img, self._full, interpolation=cv2.INTER_LINEAR)
+
+    def tex(self, k: int) -> np.ndarray:
+        """Local contrast in a k x k window (at the analysis scale)."""
+        if k not in self._tex:
+            self._tex[k] = self._up(_local_std(self._gray_small, k))
+        return self._tex[k]
+
+
+_FEATURE_CACHE: list = []
+
+
+def _features(src: np.ndarray, bg: np.ndarray, photo_diag: float | None = None) -> _PixelFeatures:
+    """Return the shared features for this exact (src, bg) pair."""
+    if _FEATURE_CACHE and _FEATURE_CACHE[0] is src and _FEATURE_CACHE[1] is bg:
+        return _FEATURE_CACHE[2]
+    feats = _PixelFeatures(src, bg, photo_diag)
+    _FEATURE_CACHE[:] = [src, bg, feats]
+    return feats
+
+
+def _release_features() -> None:
+    _FEATURE_CACHE.clear()
+
+
+def _component_means(labels: np.ndarray, ids_mask: np.ndarray, count: int, images) -> list:
+    """Mean of each image per component, using only the selected pixels.
+
+    ``ids_mask`` marks the pixels to visit, so the work scales with the
+    candidate regions instead of the whole image.
+    """
+    sel = np.flatnonzero(ids_mask)
+    lab = labels.ravel()[sel]
+    cnt = np.maximum(np.bincount(lab, minlength=count).astype(np.float64), 1.0)
+    return [np.bincount(lab, weights=img.ravel()[sel].astype(np.float64), minlength=count) / cnt
+            for img in images]
+
+
+def _backdrop_mode(bg: np.ndarray, cfg: dict):
+    """'clipped' (blown-out white), 'light' (light grey) or None."""
+    b = bg[::4, ::4].astype(np.float32)
+    bg_lum = float(np.median(b.mean(axis=2)))
+    if bg_lum >= float(cfg.get("clipped_backdrop_lum", 245.0)):
+        return "clipped", bg_lum
+    if _light_backdrop(bg, cfg):
+        return "light", bg_lum
+    return None, bg_lum
+
+
+def clear_white_pockets(src: np.ndarray, bg: np.ndarray, alpha: np.ndarray, cfg: dict,
+                        photo_diag: float | None = None) -> int:
+    """Final pass for white / light-grey backdrops: clear small backdrop pockets.
+
+    Between chain links, beads and jump rings the backdrop shows through gaps
+    of a few pixels. They are too small for the hole passes, so they stay
+    opaque and show as white/grey dots on a dark page. A pocket is cleared when
+    its rim is gold / black bead; a pale spot ringed by grey facets is diamond
+    sparkle and is kept - unless it matches the backdrop exactly (an opening
+    inside a ring of stones).
     """
     if not cfg.get("clear_white_pockets", True):
         return 0
-    bg_lum = float(np.median(bg[::4, ::4].astype(np.float32).mean(axis=2)))
-    if bg_lum < float(cfg.get("clipped_backdrop_lum", 245.0)):
+    mode, bg_lum = _backdrop_mode(bg, cfg)
+    if mode is None:
         return 0
-    s = src.astype(np.float32, copy=False)
-    mn = s.min(axis=2)
-    mx = s.max(axis=2)
-    lum = s.mean(axis=2)
-    white = ((mn >= float(cfg.get("white_pocket_min_lum", 245.0))) & (alpha > 0)).astype(np.uint8)
+    clipped = mode == "clipped"
+    f = _features(src, bg, photo_diag)
+    mx, mn, lum = f.mx, f.mn, f.lum
+    visible = alpha > 0
+    if clipped:
+        white = (mn >= float(cfg.get("white_pocket_min_lum", 245.0))) & visible
+    else:
+        # grey backdrop seen through a jump ring / between limbs of a figure
+        tex = f.tex(3)
+        white = (f.dlum > -float(cfg.get("backdrop_pocket_darker", 15.0))) & \
+                (f.dlum < float(cfg.get("backdrop_pocket_brighter", 40.0))) & \
+                (f.sat < float(cfg.get("backdrop_pocket_sat", 0.2))) & \
+                (tex < float(cfg.get("backdrop_pocket_texture", 9.0))) & visible
+    white = white.astype(np.uint8)
     if not white.any():
         return 0
+    # transparent area connected to the photo border = outside the jewellery;
+    # a pocket touching it is the product's outer edge, not a hole
+    clear_bg = (alpha < 64).astype(np.uint8)
+    n_o, lab_o, st_o, _ = cv2.connectedComponentsWithStats(clear_bg, connectivity=8)
+    keep_o = np.zeros(n_o, bool)
+    keep_o[np.unique(np.concatenate([lab_o[0], lab_o[-1], lab_o[:, 0], lab_o[:, -1]]))] = True
+    keep_o |= st_o[:, cv2.CC_STAT_AREA] > 0.05 * alpha.size
+    keep_o[0] = False
+    outside = keep_o[lab_o]
+    if not clipped:
+        # grey backdrops only: there the pocket colour test also matches the
+        # pale rim of the product, which must not join a hole to the outside
+        halo = cv2.dilate(outside.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        white[halo] = 0
     count, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
-    grey_facet = ((mx - mn) < 20) & (lum > 90) & (lum < float(cfg.get("white_pocket_min_lum", 245.0)))
-    max_px = int(cfg.get("white_pocket_max_px", 150))
-    max_share = float(cfg.get("white_pocket_max_facet_share", 0.3))
-    k = np.ones((5, 5), np.uint8)
-    clear = np.zeros(alpha.shape, bool)
+    if count <= 1:
+        return 0
+    areas = stats[:, cv2.CC_STAT_AREA]
+    # pocket sizes are in pixels: scale them with the photo, or a jump ring
+    # hole in a 30 MP photo is "too big" while the same hole at 3 MP is not
+    scale = max(1.0, alpha.size / float(cfg.get("white_pocket_ref_px", 2_000_000)))
+    max_px = int(float(cfg.get("white_pocket_max_px", 150)) * scale)
     big_px = max(max_px, int(float(cfg.get("white_pocket_big_ratio", 0.0002)) * alpha.size))
     big_alpha = float(cfg.get("white_pocket_big_max_alpha", 230))
-    for i in range(1, count):
-        x, y, w, h, area = stats[i]
-        if area > big_px:
-            continue
-        if area > max_px:
-            # larger pocket (inside a jump ring): only when the model itself
-            # was unsure - a solid white highlight on gold stays
-            if float(alpha[y:y + h, x:x + w][labels[y:y + h, x:x + w] == i].mean()) >= big_alpha:
-                continue
-        y0, y1, x0, x1 = max(0, y - 3), y + h + 3, max(0, x - 3), x + w + 3
+    min_px = 0 if clipped else int(float(cfg.get("backdrop_pocket_min_ratio", 4e-6)) * alpha.size)
+
+    exact = np.zeros(count, bool)
+    if not clipped:
+        exact_max = int(float(cfg.get("backdrop_pocket_exact_max_ratio", 0.001)) * alpha.size)
+        maybe = (areas >= int(cfg.get("backdrop_pocket_exact_min_px", 40))) & (areas <= exact_max)
+        maybe[0] = False
+        if maybe.any():
+            m_dl, m_sat, m_flat = _component_means(
+                labels, maybe[labels], count,
+                (np.abs(f.dlum), f.sat, (f.tex(3) < 3.0).astype(np.float32)))
+            exact = maybe & (m_dl < float(cfg.get("backdrop_pocket_exact_lum", 8.0))) & \
+                (m_flat >= float(cfg.get("backdrop_pocket_exact_flat_share", 0.15))) & \
+                (m_sat < float(cfg.get("backdrop_pocket_exact_sat", 0.05)))
+
+    # size gates for every component at once; only survivors reach the loop
+    cand = (areas >= min_px) & ((areas <= big_px) | exact)
+    cand[0] = False
+    if not cand.any():
+        return 0
+    big = cand & (areas > max_px) & ~exact
+    if big.any():
+        (m_alpha,) = _component_means(labels, big[labels], count, (alpha,))
+        cand &= ~(big & (m_alpha >= big_alpha))   # solid white highlight on gold stays
+
+    grey_facet = ((mx - mn) < 20) & (lum > 90) & (lum < float(cfg.get("white_pocket_min_lum", 245.0)))
+    if not clipped:
+        grey_facet &= white == 0
+    max_share = float(cfg.get("white_pocket_max_facet_share", 0.3))
+    k5 = np.ones((5, 5), np.uint8)
+    k9 = np.ones((9, 9), np.uint8)
+    clear = np.zeros(alpha.shape, bool)
+    for i in np.flatnonzero(cand):
+        x, y, w, h, _ = stats[i]
+        y0, y1, x0, x1 = max(0, y - 5), y + h + 5, max(0, x - 5), x + w + 5
         comp = (labels[y0:y1, x0:x1] == i).astype(np.uint8)
-        ring = (cv2.dilate(comp, k) > 0) & (comp == 0) & (alpha[y0:y1, x0:x1] >= 128) & (white[y0:y1, x0:x1] == 0)
-        if ring.sum() == 0:
+        ring = (cv2.dilate(comp, k5) > 0) & (comp == 0) & (alpha[y0:y1, x0:x1] >= 128) & (white[y0:y1, x0:x1] == 0)
+        if not ring.any():
             continue
-        if float(grey_facet[y0:y1, x0:x1][ring].mean()) >= max_share:
+        if not clipped:
+            rim = (cv2.dilate(comp, k9) > 0) & (comp == 0)
+            if outside[y0:y1, x0:x1][rim].any():
+                continue                   # open to the outside: product edge
+        if not exact[i] and float(grey_facet[y0:y1, x0:x1][ring].mean()) >= max_share:
             continue                       # diamond sparkle
         clear[y0:y1, x0:x1] |= comp.astype(bool)
     if not clear.any():
         return 0
     # soft edge: pale, neutral pixels right beside the pocket are mostly backdrop too
     edge = cv2.dilate(clear.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool) & ~clear
-    edge &= ((mx - mn) < 25) & (lum > 225)
-    n = int((alpha[clear] > 0).sum())
+    edge &= ((mx - mn) < 25) & ((lum > 225) if clipped else (white > 0) | (lum > bg_lum - 20))
+    n = int(np.count_nonzero(alpha[clear]))
     alpha[clear] = 0
     alpha[edge] = (alpha[edge] * 0.35).astype(np.uint8)
     return n
 
 
 class _ClippedBackdropGuard:
-    """Undo clean-up cuts that remove real product on a pure-white backdrop.
+    """Undo clean-up cuts that remove real product on white / light-grey backdrops.
 
     Most passes tell a diamond facet / polished highlight from a hollow by
-    "brighter than the backdrop". On a blown-out white backdrop (255,255,255)
-    nothing can be brighter, so that safeguard silently switches off: white
-    stones, bright bezel rims and thin gold highlights all look like
-    "backdrop-coloured gaps" and get cut out (visible as missing bits once the
-    PNG is put on a black page). On such photos this guard runs after every
-    hole/gap pass and puts back any cut region that
+    "brighter than the backdrop". On a blown-out white backdrop nothing can be
+    brighter, and on light grey the stones are the backdrop's own grey, so
+    white stones, bright rims and thin highlights look like "backdrop-coloured
+    gaps" and get cut out. This guard runs after every hole/gap pass and puts
+    back any cut region that lies in a stone zone (next to neutral, dark facet
+    lines) - or, on white, that the model was confident about - unless the
+    region looks like plain backdrop (a real opening).
 
-      * lies in a stone zone (next to neutral, dark facet lines), or
-      * the model was confident about (mean alpha >= white_guard_model_alpha),
-
-    unless the region is pure, perfectly flat backdrop - a real see-through gap.
-    On grey / coloured backdrops it does nothing.
+    The per-pixel measures are built lazily, on the first cut, and shared with
+    the pocket pass; per-cut statistics only visit the cut pixels.
     """
 
     def __init__(self, src, bg, model_alpha, cfg, diag):
@@ -1556,54 +1743,119 @@ class _ClippedBackdropGuard:
         self.restored = 0
         if not cfg.get("protect_on_white_backdrop", True) or model_alpha is None:
             return
-        bg = bg.astype(np.float32, copy=False)
-        bg_lum = float(np.median(bg[::4, ::4].mean(axis=2)))
-        if bg_lum < float(cfg.get("clipped_backdrop_lum", 245.0)):
+        mode, _ = _backdrop_mode(bg, cfg)
+        if mode is None or (mode == "light" and not cfg.get("protect_on_light_backdrop", True)):
             return
         self.on = True
+        self.clipped = mode == "clipped"
         self.cfg = cfg
         self.model = model_alpha
-        src = src.astype(np.float32, copy=False)
-        diff = src - bg
-        self.dist = np.sqrt((diff * diff).sum(axis=2))
-        gray = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)
-        self.fine = _local_std(gray, 5)
-        lum = diff.mean(axis=2)
-        mx, mn = src.max(axis=2), src.min(axis=2)
-        neutral = (mx - mn) / np.maximum(mx, 1.0) < 0.10   # diamonds are grey, gold is not
+        self._src, self._bg, self._diag = src, bg, diag
+        self._ready = False
+
+    def _prepare(self) -> None:
+        if self._ready:
+            return
+        cfg, f = self.cfg, _features(self._src, self._bg, self._diag)
+        self.dist = f.dist
+        self.fine = f.tex(5)
+        self.backdrop_like = (
+            (np.abs(f.dlum) < float(cfg.get("light_backdrop_like_lum", 30.0)))
+            & (f.sat < float(cfg.get("light_backdrop_like_sat", 0.10)))
+            & (f.tex(3) < float(cfg.get("light_backdrop_like_texture", 6.0)))
+        ).astype(np.float32)
+        self.near = (f.dist < float(cfg.get("light_opening_near_dist", 10.0))).astype(np.float32)
         facets = (
-            neutral
-            & (lum < -float(cfg.get("white_guard_facet_dark", 35.0)))
+            (f.sat < 0.10)                                       # diamonds are grey, gold is not
+            & (f.dlum < -float(cfg.get("white_guard_facet_dark", 35.0)))
+            & (f.lum > float(cfg.get("white_guard_facet_min_lum", 70.0)))  # not black beads
             & (self.fine > float(cfg.get("white_guard_facet_texture", 8.0)))
-            & (model_alpha >= 128)
+            & (self.model >= 128)
         ).astype(np.uint8)
-        r = max(3, int(round(float(cfg.get("white_guard_stone_ratio", 0.004)) * diag)))
+        r = max(3, int(round(float(cfg.get("white_guard_stone_ratio", 0.004)) * self._diag)))
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        zone = cv2.dilate(facets, k)
-        self.stone = cv2.morphologyEx(zone, cv2.MORPH_CLOSE, k).astype(bool)
+        self.stone = cv2.morphologyEx(cv2.dilate(facets, k), cv2.MORPH_CLOSE, k).astype(np.float32)
+        self._ready = True
+
+    def _exact(self, means: dict) -> np.ndarray:
+        cfg = self.cfg
+        if self.clipped:
+            ed = float(cfg.get("white_guard_exact_dist", 6.0))
+            et = float(cfg.get("white_guard_exact_texture", 2.5))
+        else:
+            ed = float(cfg.get("light_guard_exact_dist", 10.0))
+            et = float(cfg.get("light_guard_exact_texture", 3.5))
+        return (means["dist"] < ed) & (means["fine"] < et)
 
     def __call__(self, before: np.ndarray, alpha: np.ndarray) -> int:
         if not self.on:
             return 0
-        cut = ((before.astype(np.int16) - alpha.astype(np.int16)) > 32).astype(np.uint8)
-        if not cut.any():
+        cut = (cv2.subtract(before, alpha) > 32).astype(np.uint8)   # saturating, no int16 copies
+        x, y, w, h = cv2.boundingRect(cut)
+        if w == 0 or h == 0:
             return 0
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(cut, connectivity=8)
-        flat = labels.ravel()
-        areas = np.maximum(stats[:, cv2.CC_STAT_AREA].astype(np.float64), 1)
-        mean = lambda img: np.bincount(flat, weights=img.ravel().astype(np.float64), minlength=count) / areas
-        m_model, m_dist, m_fine, m_stone = mean(self.model), mean(self.dist), mean(self.fine), mean(self.stone)
+        self._prepare()
+        sl = (slice(y, y + h), slice(x, x + w))
+        count, labels = cv2.connectedComponents(cut[sl], connectivity=8)
+        m_model, m_dist, m_fine, m_stone, m_like = _component_means(
+            labels, labels > 0, count,
+            (self.model[sl], self.dist[sl], self.fine[sl], self.stone[sl], self.backdrop_like[sl]))
+        m_near = (_component_means(labels, labels > 0, count, (self.near[sl],))[0]
+                  if not self.clipped else None)
         cfg = self.cfg
-        exact = (m_dist < float(cfg.get("white_guard_exact_dist", 6.0))) & \
-                (m_fine < float(cfg.get("white_guard_exact_texture", 2.5)))
-        confident = m_model >= float(cfg.get("white_guard_model_alpha", 220))
-        put_back = ~exact & ((m_stone >= 0.5) | confident)
+        exact = self._exact({"dist": m_dist, "fine": m_fine})
+        if self.clipped:
+            confident = m_model >= float(cfg.get("white_guard_model_alpha", 220))
+            put_back = ~exact & ((m_stone >= 0.5) | confident)
+        else:
+            # grey backdrop: the "brighter than backdrop" test still works for
+            # sparkle, so only stones are protected (not every confident cut)
+            exact |= (m_like >= float(cfg.get("light_guard_exact_share", 0.5))) | \
+                     (m_near >= float(cfg.get("light_opening_near_share", 0.65)))
+            put_back = ~exact & (m_stone >= 0.5)
         put_back[0] = False
         if not put_back.any():
             return 0
         mask = put_back[labels]
-        alpha[mask] = before[mask]
-        n = int(mask.sum())
+        a, b = alpha[sl], before[sl]
+        a[mask] = b[mask]
+        n = int(np.count_nonzero(mask))
+        self.restored += n
+        return n
+
+    def fill_stone_holes(self, alpha: np.ndarray) -> int:
+        """Close see-through holes inside diamonds, whoever made them.
+
+        A hole is closed when it is enclosed by product, lies in a stone zone
+        and is not plain backdrop (a real opening stays open).
+        """
+        if not self.on or not self.cfg.get("fill_stone_holes", True):
+            return 0
+        holes = (alpha < 128).astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
+        if count <= 1:
+            return 0
+        cap = float(self.cfg.get("stone_hole_max_ratio", 0.0004)) * alpha.size
+        cand = stats[:, cv2.CC_STAT_AREA] <= cap
+        cand[np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))] = False
+        cand[0] = False
+        if not cand.any():
+            return 0
+        self._prepare()
+        m_stone, m_dist, m_fine, m_like, m_near = _component_means(
+            labels, cand[labels], count,
+            (self.stone, self.dist, self.fine, self.backdrop_like, self.near))
+        # mostly backdrop-like or backdrop-coloured = a real opening
+        exact = self._exact({"dist": m_dist, "fine": m_fine})
+        exact |= m_like >= float(self.cfg.get("light_guard_exact_share", 0.5))
+        if not self.clipped:
+            exact |= m_near >= float(self.cfg.get("light_opening_near_share", 0.65))
+        fill = cand & (m_stone >= 0.6) & ~exact
+        if not fill.any():
+            return 0
+        mask = fill[labels]
+        alpha[mask] = 255
+        n = int(np.count_nonzero(mask))
         self.restored += n
         return n
 
@@ -1614,7 +1866,6 @@ class _ClippedBackdropGuard:
         if self.on:
             self(before, alpha)
         return result
-
 
 def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None = None,
                 background: np.ndarray | None = None, reference_size: tuple | None = None):
@@ -1653,8 +1904,10 @@ def clean_matte(source_rgb: np.ndarray, alpha: np.ndarray, settings: dict | None
     stats["flat_backdrop_px"] = g(clear_flat_backdrop, alpha, ctx.src, ctx.bg, alpha, cfg)
     stats["wedge_px"] = g(clear_backdrop_wedges, alpha, ctx.src, ctx.bg, alpha, cfg)
     stats["finished_edge_px"] = g(finish_edges, alpha, ctx.src, ctx.bg, alpha, cfg, ctx.diag, model_alpha)
+    stats["stone_hole_px"] = guard.fill_stone_holes(alpha)
     stats["white_backdrop_guard_px"] = guard.restored
-    stats["white_pocket_px"] = clear_white_pockets(ctx.src, ctx.bg, alpha, cfg)
+    stats["white_pocket_px"] = clear_white_pockets(ctx.src, ctx.bg, alpha, cfg, ctx.diag)
+    _release_features()
     return alpha, stats, ctx
 
 
@@ -1714,8 +1967,10 @@ def _clean_matte_large(source_rgb, alpha, settings, cfg, background, reference_s
     stats["flat_backdrop_px"] = g(clear_flat_backdrop, out, source_rgb, bg_full, out, cfg)
     stats["wedge_px"] = g(clear_backdrop_wedges, out, source_rgb, bg_full, out, cfg)
     stats["finished_edge_px"] = g(finish_edges, out, source_rgb, bg_full, out, cfg, float(np.hypot(ref_h, ref_w)), alpha)
+    stats["stone_hole_px"] = stats.get("stone_hole_px", 0) + guard.fill_stone_holes(out)
     stats["white_backdrop_guard_px"] = stats.get("white_backdrop_guard_px", 0) + guard.restored
-    stats["white_pocket_px"] = clear_white_pockets(source_rgb, bg_full, out, cfg)
+    stats["white_pocket_px"] = clear_white_pockets(source_rgb, bg_full, out, cfg, float(np.hypot(ref_h, ref_w)))
+    _release_features()
 
     class _FullCtx:
         """What callers use from the context, at full resolution."""

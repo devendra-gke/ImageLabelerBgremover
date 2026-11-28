@@ -51,6 +51,8 @@ DETECTION_DEFAULTS = {
     "unseen_min_long_side": 0.05,      # part's long side / image long side
     # Cut out every separate item on its own crop as well, so each one is
     # the main subject for the model (thin chains are otherwise lost).
+    "drop_edge_props": True,           # small separate bits cut by the photo edge (stand, prop)
+    "edge_prop_max_share": 0.05,       # ... smaller than this share of the main item
     "refine_each_part": True,
     "refine_part_margin": 0.06,
 }
@@ -190,7 +192,14 @@ def find_product_parts(source_rgb: np.ndarray, coarse_alpha: np.ndarray, cfg: di
             box[2], box[3] = max(box[2], x + bw), max(box[3], y + bh)
     if not groups:
         return [], None
-    boxes = [b[:4] for b in sorted(groups.values(), key=lambda b: -b[4])]
+    ordered = sorted(groups.values(), key=lambda b: -b[4])
+    if cfg.get("drop_edge_props", True) and len(ordered) > 1:
+        main_area = ordered[0][4]
+        share = float(cfg.get("edge_prop_max_share", 0.05))
+        def at_edge(b):
+            return b[0] <= 1 or b[1] <= 1 or b[2] >= w - 1 or b[3] >= h - 1
+        ordered = [ordered[0]] + [b for b in ordered[1:] if not (at_edge(b) and b[4] < share * main_area)]
+    boxes = [b[:4] for b in ordered]
     return boxes, _union(boxes)
 
 

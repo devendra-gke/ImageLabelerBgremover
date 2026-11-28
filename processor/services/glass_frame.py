@@ -51,15 +51,21 @@ DEFAULTS = {
     "glass_ring_coverage": 0.75,  # share of the circumference traced by lines
     "glass_ring_max_width": 0.12, # band width / radius (a filled disc is not a rim)
     "glass_ring_pad_px": 1.5,     # anti-aliased line edge kept on both sides
+    # "lines": keep only the drawn lines/ticks; the white band and the small
+    #          boxes between the ticks become transparent (default)
+    # "solid": keep the whole rim opaque, white band included
+    "glass_rim_mode": "lines",
+    "glass_line_noise": 6.0,      # lines must be this much darker than the white band
+    "glass_band_grow_px": 3,      # also clean model haze just outside the rim
 }
 
 
 def _largest_frame(rgb: np.ndarray, cfg: dict):
     """Return (hull_mask, frame_h) on the proxy image or None."""
     h, w = rgb.shape[:2]
-    rgb_i = rgb.astype(np.int16)
-    lum = rgb_i.mean(axis=2)
-    chroma = rgb_i.max(axis=2) - rgb_i.min(axis=2)
+    c0, c1, c2 = cv2.split(np.ascontiguousarray(rgb))
+    lum = (c0.astype(np.float32) + c1 + c2) / np.float32(3.0)
+    chroma = cv2.max(cv2.max(c0, c1), c2) - cv2.min(cv2.min(c0, c1), c2)   # uint8, never negative
     dark = ((lum < cfg["glass_dark_lum"]) & (chroma < cfg["glass_max_chroma"])).astype(np.uint8)
     if dark.sum() < 500:
         return None
@@ -134,9 +140,9 @@ def _ring_frame(rgb: np.ndarray, cfg: dict):
     if not cfg.get("glass_ring_enabled", True):
         return None
     h, w = rgb.shape[:2]
-    rgb_i = rgb.astype(np.int16)
-    lum = rgb_i.mean(axis=2)
-    chroma = rgb_i.max(axis=2) - rgb_i.min(axis=2)
+    c0, c1, c2 = cv2.split(np.ascontiguousarray(rgb))
+    lum = (c0.astype(np.float32) + c1 + c2) / np.float32(3.0)
+    chroma = cv2.max(cv2.max(c0, c1), c2) - cv2.min(cv2.min(c0, c1), c2)
     line = ((lum > cfg["glass_ring_min_lum"]) & (lum < cfg["glass_ring_max_lum"])
             & (chroma < cfg["glass_ring_max_chroma"])).astype(np.uint8)
     if line.sum() < 500:
@@ -179,6 +185,12 @@ def _ring_frame(rgb: np.ndarray, cfg: dict):
 
 def glass_frame_mask(source_rgb: np.ndarray, settings: dict | None = None):
     """Soft 0..1 mask (full resolution) of the lens rim, or None."""
+    found = _frame_mask(source_rgb, settings)
+    return None if found is None else found[0]
+
+
+def _frame_mask(source_rgb: np.ndarray, settings: dict | None = None):
+    """(soft rim mask, kind) with kind "ring" (light lines) or "stadium" (dark lines)."""
     cfg = {**DEFAULTS, **(settings or {})}
     if not cfg["preserve_glass_frame"]:
         return None
@@ -190,7 +202,9 @@ def glass_frame_mask(source_rgb: np.ndarray, settings: dict | None = None):
     else:
         proxy = source_rgb
     rim = _ring_frame(proxy, cfg)
+    kind = "ring"
     if rim is None:
+        kind = "stadium"
         found = _largest_frame(proxy, cfg)
         if found is None:
             return None
@@ -203,19 +217,57 @@ def glass_frame_mask(source_rgb: np.ndarray, settings: dict | None = None):
         mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_LINEAR)
     sigma = max(0.7, 0.8 / scale * 0.5)
     mask = cv2.GaussianBlur(mask, (0, 0), sigma)
-    return np.clip(mask * 1.15, 0.0, 1.0)
+    return np.clip(mask * 1.15, 0.0, 1.0), kind
 
 
 def restore_glass_frame(rgba: np.ndarray, source_rgb: np.ndarray,
                         settings: dict | None = None) -> int:
-    """Union the lens rim into an RGBA cut-out in place; returns pixels added."""
-    mask = glass_frame_mask(source_rgb, settings)
-    if mask is None:
+    """Put the lens rim into an RGBA cut-out in place; returns pixels changed.
+
+    In "lines" mode only the drawn lines and tick marks are kept: each pixel's
+    opacity is how much darker it is than the white band, and its colour is
+    the line colour, so the white band and the small boxes between the ticks
+    become transparent with clean anti-aliased lines. Product crossing the rim
+    (gold, black beads) is left exactly as the cut-out made it.
+    """
+    cfg = {**DEFAULTS, **(settings or {})}
+    found = _frame_mask(source_rgb, settings)
+    if found is None:
         return 0
-    old = rgba[..., 3].astype(np.float32) / 255.0
-    add = mask > old
-    if not add.any():
+    mask, kind = found
+    if str(cfg.get("glass_rim_mode", "lines")).lower() == "solid":
+        old = rgba[..., 3].astype(np.float32) / 255.0
+        add = mask > old
+        if not add.any():
+            return 0
+        rgba[..., :3][add] = source_rgb[add]
+        rgba[..., 3] = np.maximum(old, mask).__mul__(255).round().astype(np.uint8)
+        return int(add.sum())
+
+    band = (mask > 0.3).astype(np.uint8)
+    grow = int(cfg.get("glass_band_grow_px", 3))
+    if grow > 0:
+        band = cv2.dilate(band, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
+    band = band.astype(bool)
+    src = source_rgb.astype(np.float32)
+    lum = src.mean(axis=2)
+    chroma = src.max(axis=2) - src.min(axis=2)
+    # frame pixels: neutral white band + drawn lines. Gold is coloured; on a
+    # light-line lens the black beads crossing the rim are too dark to count.
+    min_lum = float(cfg.get("glass_ring_min_lum", 110)) if kind == "ring" else 0.0
+    max_chroma = float(cfg.get("glass_ring_max_chroma", 14)) + 4 if kind == "ring" else float(cfg["glass_max_chroma"])
+    frame = band & (chroma < max_chroma) & (lum > min_lum)
+    if frame.sum() < 50:
         return 0
-    rgba[..., :3][add] = source_rgb[add]
-    rgba[..., 3] = np.maximum(old, mask).__mul__(255).round().astype(np.uint8)
-    return int(add.sum())
+    white = float(np.percentile(lum[frame], 97))
+    noise = float(cfg.get("glass_line_noise", 6.0))
+    drawn = frame & (lum < white - 3 * noise)
+    line_lum = float(np.percentile(lum[drawn], 5)) if drawn.sum() > 20 else white - 80.0
+    span = max(white - line_lum, 10.0)
+    a = np.clip((white - noise - lum[frame]) / (span - noise), 0.0, 1.0)
+    line_rgb = np.median(src[drawn], axis=0) if drawn.sum() > 20 else np.full(3, line_lum)
+    line_rgb = np.clip(line_rgb * 0 + line_lum, 0, 255)      # neutral, at full line strength
+    before = rgba[..., 3][frame].copy()
+    rgba[..., :3][frame] = line_rgb.round().astype(np.uint8)
+    rgba[..., 3][frame] = (a * 255 + 0.5).astype(np.uint8)
+    return int((rgba[..., 3][frame] != before).sum())

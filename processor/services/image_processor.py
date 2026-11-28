@@ -254,13 +254,20 @@ def preserve_original_product_pixels(
 
     # Pixels that clearly stand out from the local backdrop. Without a
     # backdrop estimate every pixel is eligible (previous behaviour).
+    # brightest channel per pixel, computed once (OpenCV per-channel max is
+    # much faster than a numpy reduction over the colour axis)
+    s0, s1, s2 = cv2.split(src)
+    src_max = cv2.max(cv2.max(s0, s1), s2)
     if backdrop is not None:
-        luma_src = src @ np.array([0.299, 0.587, 0.114], np.float32)
-        luma_bg = backdrop @ np.array([0.299, 0.587, 0.114], np.float32)
+        bk = np.ascontiguousarray(backdrop, dtype=np.float32)
+        # RGB2GRAY uses the same 0.299/0.587/0.114 weights as before
+        luma_src = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)
+        luma_bg = cv2.cvtColor(bk, cv2.COLOR_RGB2GRAY)
         brighter_than_backdrop = (luma_src - luma_bg) >= float(
             product_protection.get("sparkle_backdrop_margin", 25))
-        diff = src - backdrop
-        differs_from_backdrop = np.sqrt((diff * diff).sum(axis=2)) >= float(
+        k0, k1, k2 = cv2.split(bk)
+        d0, d1, d2 = s0 - k0, s1 - k1, s2 - k2
+        differs_from_backdrop = cv2.sqrt(d0 * d0 + d1 * d1 + d2 * d2) >= float(
             product_protection.get("facet_backdrop_contrast", 30))
     else:
         brighter_than_backdrop = np.ones(alpha_u8.shape, bool)
@@ -311,7 +318,7 @@ def preserve_original_product_pixels(
             highlight_threshold = float(
                 product_protection.get("highlight_threshold", 228)
             )
-            highlight_mask = (np.max(src, axis=2) >= highlight_threshold) & brighter_than_backdrop
+            highlight_mask = (src_max >= highlight_threshold) & brighter_than_backdrop
             eligible = edge & (~highlight_mask)
 
             if np.any(eligible):
@@ -352,12 +359,8 @@ def preserve_original_product_pixels(
 
     if alpha_expand_px > 0:
         kernel = (alpha_expand_px * 2) + 1
-        expanded_alpha = np.asarray(
-            Image.fromarray(alpha_u8, mode="L").filter(
-                ImageFilter.MaxFilter(size=kernel)
-            ),
-            dtype=np.uint8,
-        )
+        # square max filter == dilation with a square kernel (OpenCV, faster)
+        expanded_alpha = cv2.dilate(alpha_u8, np.ones((kernel, kernel), np.uint8))
     else:
         expanded_alpha = alpha_u8.copy()
 
@@ -380,7 +383,7 @@ def preserve_original_product_pixels(
             # Protect only bright pixels close to the nearest existing
             # product border. This preserves diamond shine while preventing
             # white studio background from being pulled into the cutout.
-            sparkle = (np.max(src, axis=2) >= highlight_threshold) & brighter_than_backdrop
+            sparkle = (src_max >= highlight_threshold) & brighter_than_backdrop
             uncertain = alpha_u8 < 245
             alpha_seed = int(
                 product_protection.get("highlight_alpha_seed", 8)
@@ -477,7 +480,7 @@ def preserve_original_product_pixels(
 
         distance_to_body = _distance_to(initial_alpha_u8 >= body_seed)
         near_body = distance_to_body <= max_haze_distance
-        bright_sparkle = (np.max(src, axis=2) >= haze_highlight_threshold) & brighter_than_backdrop
+        bright_sparkle = (src_max >= haze_highlight_threshold) & brighter_than_backdrop
 
         haze = (
             (alpha_u8 > 0)
@@ -756,8 +759,119 @@ def get_series(df, col_letter):
     return df.iloc[:, idx]
 
 
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def safe_filename(name, fallback: str = "image", max_len: int = 150) -> str:
+    """A file/folder name that Windows, macOS and Linux all accept.
+
+    Uploaded names can carry characters that are invisible in the UI but
+    rejected by Windows with "OSError: [Errno 22] Invalid argument": control
+    characters (tab, newline), zero-width / non-breaking spaces, < > : " | ? *
+    or a trailing dot/space. These are replaced; readable characters
+    (letters in any script, digits, spaces, - _ ( ) etc.) are kept.
+    """
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", str(name))
+    out = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if ch in '<>:"/\\|?*' or cat in ("Cc", "Cf", "Cs", "Co", "Cn"):
+            out.append("_")                 # forbidden or invisible character
+        elif cat.startswith("Z"):
+            out.append(" ")                 # any kind of space -> plain space
+        else:
+            out.append(ch)
+    text = re.sub(r" {2,}", " ", "".join(out)).strip().rstrip(". ")
+    if not text:
+        text = fallback
+    if text.split(".")[0].upper() in _WINDOWS_RESERVED:
+        text = "_" + text
+    return text[:max_len].rstrip(". ") or fallback
+
+
+# ----------------------------------------------------------------------
+# File properties (author / software) written into every saved image
+# ----------------------------------------------------------------------
+DEFAULT_IMAGE_AUTHOR = "GK -Devendra -Image BGRemove"
+
+_EXIF_ARTIST = 0x013B      # "Artist" - Authors in most viewers
+_EXIF_SOFTWARE = 0x0131
+_EXIF_XP_AUTHOR = 0x9C9D   # Windows Explorer > Properties > Details > Authors
+
+
+def image_metadata(preset: dict | None = None) -> dict:
+    """Author / software for saved files.
+
+    Order: preset ``"metadata": {"author": ..., "software": ...}``, then the
+    IMAGE_AUTHOR / IMAGE_SOFTWARE environment variables, then the default.
+    """
+    meta = dict((preset or {}).get("metadata") or {})
+    author = str(meta.get("author") or os.getenv("IMAGE_AUTHOR") or DEFAULT_IMAGE_AUTHOR).strip()
+    software = str(meta.get("software") or os.getenv("IMAGE_SOFTWARE") or "Image BGRemove").strip()
+    return {"author": author, "software": software}
+
+
+def _exif_with_author(meta: dict, source_exif: bytes | None = None) -> bytes:
+    """EXIF block with the author set, keeping the photo's own EXIF data."""
+    exif = Image.Exif()
+    if source_exif:
+        try:
+            exif.load(source_exif)
+        except Exception:
+            exif = Image.Exif()        # unreadable camera EXIF: start clean
+    exif[_EXIF_ARTIST] = meta["author"]
+    exif[_EXIF_SOFTWARE] = meta["software"]
+    # Windows reads XP* tags as UTF-16LE bytes ending in a null character
+    exif[_EXIF_XP_AUTHOR] = (meta["author"] + "\x00").encode("utf-16-le")
+    return exif.tobytes()
+
+
+def _xmp_packet(meta: dict) -> str:
+    from xml.sax.saxutils import escape
+    a, sw = escape(meta["author"]), escape(meta["software"])
+    return (
+        '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:xmp="http://ns.adobe.com/xap/1.0/">'
+        f'<dc:creator><rdf:Seq><rdf:li>{a}</rdf:li></rdf:Seq></dc:creator>'
+        f'<xmp:CreatorTool>{sw}</xmp:CreatorTool>'
+        '</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>'
+    )
+
+
+def metadata_save_options(save_format: str, meta: dict, source_exif: bytes | None = None) -> dict:
+    """Extra ``Image.save`` keyword arguments that write the author/software.
+
+    JPEG/WEBP: EXIF (Artist, Software, Windows XPAuthor) plus XMP.
+    PNG: text chunks (Author, Software), an XMP packet and an eXIf block.
+    The PNG gets a fresh EXIF (no camera orientation tag), because its
+    pixels are saved exactly as they are and must not be rotated by viewers.
+    """
+    fmt = save_format.upper()
+    if fmt in ("JPEG", "JPG", "WEBP"):
+        opts = {"exif": _exif_with_author(meta, source_exif)}
+        if fmt != "WEBP":
+            opts["xmp"] = _xmp_packet(meta).encode("utf-8")   # used by Pillow >= 11
+        return opts
+    if fmt == "PNG":
+        from PIL.PngImagePlugin import PngInfo
+        info = PngInfo()
+        info.add_text("Author", meta["author"])
+        info.add_text("Software", meta["software"])
+        info.add_itxt("XML:com.adobe.xmp", _xmp_packet(meta))
+        return {"pnginfo": info, "exif": _exif_with_author(meta)}
+    return {}
+
+
 def sanitize(name):
-    return str(name).replace("/", "_").replace("\\", "_").strip()
+    return safe_filename(name, fallback="Others")
 
 
 def image_to_base64(img):
@@ -1288,6 +1402,10 @@ def process_images(request):
             filename = img_file.name
             ext = os.path.splitext(filename)[1].lower()
             name = os.path.splitext(filename)[0]
+            # names used on disk; ``filename`` / ``name`` stay as uploaded
+            # for the Excel lookup and the response
+            save_name = safe_filename(name)
+            save_filename = save_name + ext
 
             if ext not in SUPPORTED_EXTS:
                 results.append({
@@ -1299,6 +1417,7 @@ def process_images(request):
 
             preset_name = resolve_preset_name(request, filename=filename)
             preset = load_preset_settings(preset_name)
+            meta = image_metadata(preset)          # author / software written into saved files
             image_settings = preset.get("image_processing", {})
             bg_settings = preset.get("background_removal", {})
             product_protection = preset.get("product_protection", {})
@@ -1443,7 +1562,7 @@ def process_images(request):
             # ---------------------------
             # Save Transparent PNG
             # ---------------------------
-            transparent_path = transparent_base / f"{name}.png"
+            transparent_path = transparent_base / f"{save_name}.png"
 
             transparent_canvas.save(
                 transparent_path,
@@ -1451,6 +1570,7 @@ def process_images(request):
                 compress_level=1,
                 dpi=tuple(source_dpi) if source_dpi else (300, 300),
                 **({"icc_profile": source_icc} if source_icc else {}),
+                **metadata_save_options("PNG", meta),
             )
 
             extra = {
@@ -1495,8 +1615,8 @@ def process_images(request):
             save_options = {"dpi": tuple(source_dpi) if source_dpi else (300, 300)}
             if source_icc and save_format in ("JPEG", "PNG", "WEBP"):
                 save_options["icc_profile"] = source_icc
-            if source_exif and save_format in ("JPEG", "WEBP"):
-                save_options["exif"] = source_exif
+            # author / software file properties (keeps the camera EXIF for JPEG)
+            save_options.update(metadata_save_options(save_format, meta, source_exif))
             if save_format == "PNG":
                 save_options["compress_level"] = 1
             elif save_format == "JPEG":
@@ -1510,14 +1630,14 @@ def process_images(request):
             category = category_map.get(excel_key, "Others")
             style = style_map.get(excel_key, "OTH")
 
-            cat_dir = itemwise_base / category
-            style_dir = style_base / style
+            cat_dir = itemwise_base / safe_filename(category, fallback="Others")
+            style_dir = style_base / safe_filename(style, fallback="OTH")
 
             cat_dir.mkdir(parents=True, exist_ok=True)
             style_dir.mkdir(parents=True, exist_ok=True)
 
-            cat_path = cat_dir / filename
-            style_path = style_dir / filename
+            cat_path = cat_dir / save_filename
+            style_path = style_dir / save_filename
             white_rgb = white_canvas.convert("RGB")
 
             white_rgb.save(

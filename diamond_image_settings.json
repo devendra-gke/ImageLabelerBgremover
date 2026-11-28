@@ -113,5 +113,9 @@
     "warn_if_product_is_cut_off": true,
     "warn_if_product_is_blurry": true,
     "require_product_visible": true
+  },
+  "metadata": {
+    "author": "GK-Image BGRemove",
+    "software": "Image BGRemove"
   }
 }
